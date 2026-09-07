@@ -3,7 +3,7 @@
 import copy
 import inspect
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from os import PathLike
 from pathlib import Path
 
@@ -272,11 +272,14 @@ def predict(
 
     buckets = _length_buckets(model, data, batch_size) if length_buckets else None
     if buckets is None:
-        data_loader = DataLoader(
-            data, batch_size=batch_size, shuffle=False, num_workers=num_workers
-        )
         predictions = _predict_epoch(
-            model, data_loader, device, show_progress=show_progress, task_idx=task_idx
+            model,
+            data,
+            device,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            show_progress=show_progress,
+            task_idx=task_idx,
         )
         return predictions.cpu().detach()
 
@@ -284,8 +287,10 @@ def predict(
     for indices, subset in buckets:
         part = _predict_epoch(
             model,
-            DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers),
+            subset,
             device,
+            batch_size=batch_size,
+            num_workers=num_workers,
             show_progress=show_progress,
             task_idx=task_idx,
         ).cpu()
@@ -444,10 +449,30 @@ def _validate_epoch(
     return float(val_loss / len(data_loader))
 
 
+def _feature_batches(data: Dataset, batch_size: int, num_workers: int) -> Iterator[list]:
+    """
+    Yield feature batches, assembled by the dataset itself where it can be.
+
+    A DeepLCDataset encodes a whole batch into one buffer per feature, which skips the
+    per-peptide tensors and the collate step a DataLoader needs. Worker processes and other
+    dataset types keep the DataLoader.
+    """
+    if isinstance(data, DeepLCDataset) and num_workers == 0:
+        for start in range(0, len(data), batch_size):
+            stop = min(start + batch_size, len(data))
+            yield list(data.encode_batch(range(start, stop)))
+    else:
+        loader = DataLoader(data, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        for features, _ in loader:
+            yield list(features)
+
+
 def _predict_epoch(
     model: torch.nn.Module,
-    data_loader: DataLoader,
+    data: Dataset,
     device: str,
+    batch_size: int = 512,
+    num_workers: int = 0,
     show_progress: bool = False,
     task_idx: Sequence[int] | None = None,
 ) -> torch.Tensor:
@@ -457,9 +482,14 @@ def _predict_epoch(
     if task_idx is not None and supports_task_subset(model):
         selected = torch.as_tensor(list(task_idx), dtype=torch.long, device=device)
     predictions = []
+    total = int(np.ceil(len(data) / batch_size)) if hasattr(data, "__len__") else None
     with torch.no_grad():
-        for features, _ in track(
-            data_loader, description="Predicting...", transient=True, disable=not show_progress
+        for features in track(
+            _feature_batches(data, batch_size, num_workers),
+            description="Predicting...",
+            transient=True,
+            disable=not show_progress,
+            total=total,
         ):
             features = [feature_tensor.to(device) for feature_tensor in features]
             outputs = model(*features) if selected is None else model(*features, task_idx=selected)

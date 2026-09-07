@@ -722,3 +722,32 @@ def test_length_buckets_are_skipped_when_they_cannot_help():
     # A four-branch model pools across positions and reports no reach, so it never buckets.
     plain = DeepLCModel(n_heads=3)
     assert getattr(plain, "padding_reach", None) is None
+
+
+def test_batch_encoding_matches_item_by_item():
+    """A batch encoded in one pass must equal the per-peptide encoding a DataLoader stacks."""
+    peptides = ["PEPTIDEK", "ACDEFGHIK", "SEQUENCEWITHK", "ACDK"]
+    dataset = DeepLCDataset(peptides, add_terminal_composition=True)
+    batch = dataset.encode_batch(range(len(peptides)))
+    for position in range(4):
+        stacked = torch.stack([dataset[i][0][position] for i in range(len(peptides))])
+        assert torch.allclose(batch[position], stacked, atol=0)
+
+
+def test_rolling_sum_is_skipped_for_the_fused_trunk():
+    """
+    The fused trunk deletes the rolling sum, so encoding does not build it.
+
+    It stays for the four-branch model, which reads it, and the flag travels with the
+    dataset rather than being decided inside the encoder.
+    """
+    assert FlexCNNMultitaskModel.uses_rolling_sum is False
+    assert getattr(DeepLCModel(n_heads=2), "uses_rolling_sum", True) is True
+
+    with_sum = DeepLCDataset(["PEPTIDEK"], add_terminal_composition=True)
+    without = DeepLCDataset(["PEPTIDEK"], add_terminal_composition=True, include_rolling_sum=False)
+    assert with_sum[0][0][1].shape[0] > 0
+    assert without[0][0][1].shape[0] == 0
+    # every other feature is untouched by the flag
+    for position in (0, 2, 3):
+        assert torch.allclose(with_sum[0][0][position], without[0][0][position], atol=0)

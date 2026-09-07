@@ -117,7 +117,9 @@ def predict(
     result = _model_ops.predict(
         model=loaded_model,
         data=DeepLCDataset.from_psm_list(
-            _parse_psms(psm_list), **_feature_kwargs_from_spec(feature_spec)
+            _parse_psms(psm_list),
+            include_rolling_sum=getattr(loaded_model, "uses_rolling_sum", True),
+            **_feature_kwargs_from_spec(feature_spec),
         ),
         **kwargs,
     ).numpy()

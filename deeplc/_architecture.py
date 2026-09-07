@@ -844,6 +844,10 @@ class FlexCNNMultitaskModel(nn.Module):
     #: Index reserved for padding positions in the residue encoding.
     PAD_INDEX = 20
 
+    #: The fused trunk reads the per-position matrix directly, so the rolling-sum array is
+    #: redundant and its ``forward`` deletes it. Encoding can skip building it.
+    uses_rolling_sum = False
+
     def __init__(
         self,
         n_tasks: int,
