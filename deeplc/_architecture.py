@@ -934,6 +934,33 @@ class FlexCNNMultitaskModel(nn.Module):
         del x_atom_sum  # the fused trunk reads x_atom directly
         return self.head(self.encoder(x_atom, x_global, x_one_hot), task_idx)
 
+    @property
+    def padding_reach(self) -> int | None:
+        """
+        How far a valid position can see across the right edge of the encoding window.
+
+        The trunk masks its output by the true residue count and pools over that mask, and
+        the features themselves do not depend on the window, so the only way padding can
+        reach a valid position is through the convolutions. Each convolution of width ``k``
+        and dilation ``d`` reaches ``(k - 1) // 2 * d`` positions, and the reaches add up.
+        A batch encoded in a window of its longest peptide plus this many positions
+        therefore predicts exactly what the full window predicts, which for a median
+        peptide of sixteen residues is a fraction of the sixty positions used otherwise.
+
+        Returns None when the trunk pools or strides across positions, because then the
+        mask no longer lines up position by position and the argument does not hold.
+
+        """
+        reach = 0
+        for module in self.encoder.modules():
+            if isinstance(module, (nn.MaxPool1d, nn.AvgPool1d)):
+                return None
+            if isinstance(module, nn.Conv1d):
+                if module.stride[0] != 1:
+                    return None
+                reach += ((module.kernel_size[0] - 1) // 2) * module.dilation[0]
+        return reach
+
     def add_task_head(
         self, targets: torch.Tensor | None = None, init_from: int | None = None
     ) -> int:

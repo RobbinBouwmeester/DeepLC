@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import TypeVar, overload
 
 import numpy as np
@@ -92,6 +93,33 @@ class DeepLCDataset(Dataset):
     def __len__(self) -> int:
         """Return number of peptidoforms in the dataset."""
         return len(self.peptidoforms)
+
+    def variant(self, indices: Sequence[int], padding_length: int) -> DeepLCDataset:
+        """
+        Return a subset of this dataset's peptidoforms, encoded in a shorter window.
+
+        Used by the prediction path to run short peptides in a window that fits them
+        instead of padding every one to the model's full length. The peptidoform objects
+        themselves are shared rather than copied, so the parsing psm_utils caches on them
+        is not paid twice.
+
+        Parameters
+        ----------
+        indices
+            Positions in this dataset to include, in the order wanted.
+        padding_length
+            Window the subset is encoded in.
+
+        """
+        targets = self.target_retention_times
+        return type(self)(
+            peptidoforms=[self.peptidoforms[i] for i in indices],
+            target_retention_times=None if targets is None else targets[list(indices)],
+            add_ccs_features=self.add_ccs_features,
+            add_terminal_composition=self.add_terminal_composition,
+            padding_length=padding_length,
+            legacy_positional_deltas=self.legacy_positional_deltas,
+        )
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
         """Return encoded features and target RT for peptidoform at index."""

@@ -667,3 +667,58 @@ def test_training_scores_its_starting_point(tmp_path):
     source = inspect.getsource(_model_ops.train)
     assert 'best_val_loss = float("inf")' not in source
     assert "_validate_epoch(model, val_loader, loss_fn, device)" in source
+
+
+# --------------------------------------------------------------------------- #
+# length-bucketed prediction
+# --------------------------------------------------------------------------- #
+
+
+def test_padding_reach_counts_the_convolutions():
+    """The reach is the sum over convolutions of ``(kernel - 1) // 2``, dilation aside."""
+    model = FlexCNNMultitaskModel(n_tasks=3, **SMALL)
+    # Two pointwise stem layers reach nothing; two kernel-5 convolutions reach two each.
+    assert model.padding_reach == 4
+    assert FlexCNNMultitaskModel(n_tasks=3, **{**SMALL, "kernel_size": 3}).padding_reach == 2
+
+
+def test_length_buckets_predict_what_the_full_window_predicts():
+    """
+    Running short peptides in a short window must not change their predictions.
+
+    The trunk masks by the true residue count and the features do not depend on the
+    window, so a window of the longest peptide plus the trunk's reach holds everything
+    that can influence a valid position. That exactness is what allows the prediction
+    path to stop padding every peptide to sixty positions.
+    """
+    model = FlexCNNMultitaskModel(n_tasks=5, **SMALL).eval()
+    peptides = ["PEPTIDEK", "ACDEFGHIK", "PEPTIDEPEPTIDEPEPTIDEK", "ACDK", "SEQUENCEWITHK"]
+    dataset = DeepLCDataset(peptides, add_terminal_composition=True)
+
+    full = _model_ops.predict(
+        model=model,
+        data=dataset,
+        device="cpu",
+        batch_size=2,
+        show_progress=False,
+        length_buckets=False,
+    )
+    bucketed = _model_ops.predict(
+        model=model,
+        data=dataset,
+        device="cpu",
+        batch_size=2,
+        show_progress=False,
+    )
+    assert bucketed.shape == full.shape
+    assert torch.allclose(bucketed, full, atol=1e-5)
+
+
+def test_length_buckets_are_skipped_when_they_cannot_help():
+    """A dataset whose longest peptide fills the window is left as one pass."""
+    model = FlexCNNMultitaskModel(n_tasks=2, **SMALL).eval()
+    short_window = DeepLCDataset(["PEPTIDEK"], add_terminal_composition=True, padding_length=10)
+    assert _model_ops._length_buckets(model, short_window, batch_size=8) is None
+    # A four-branch model pools across positions and reports no reach, so it never buckets.
+    plain = DeepLCModel(n_heads=3)
+    assert getattr(plain, "padding_reach", None) is None
