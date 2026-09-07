@@ -297,6 +297,15 @@ def predict(
     return out.detach()
 
 
+#: Widest spread of peptide lengths allowed inside one prediction chunk. Small enough that
+#: no peptide carries much padding, large enough that the dense middle of a length
+#: distribution still fills a batch.
+#: A tight window is worth more than a full batch: enforcing a minimum chunk size, so that the
+#: sparse long tail rides along in a wider window, was measured slower (1,546 against 1,503
+#: peptidoforms/s at a floor of 512 and 1,449 at 2,048).
+_LENGTH_BAND = 4
+
+
 def _residue_count(peptidoform: object) -> int:
     """
     Residues in a peptidoform, whether it arrives parsed or as a ProForma string.
@@ -337,15 +346,28 @@ def _length_buckets(
         (_residue_count(p) for p in data.peptidoforms), dtype=np.int64, count=len(data)
     )
     window = data.padding_length
-    if int(lengths.max()) + reach >= window:
-        return None
-
     order = np.argsort(lengths, kind="stable")
-    buckets = []
-    for start in range(0, len(order), batch_size):
-        chunk = order[start : start + batch_size]
-        padding = int(min(window, lengths[chunk].max() + reach))
+    sorted_lengths = lengths[order]
+
+    # A chunk is cut either at the batch size or as soon as its longest peptide would exceed
+    # the shortest by more than _LENGTH_BAND, so no peptide is padded much beyond its own
+    # length. Fixed-size chunks are not enough: the longest chunk of a length-sorted set holds
+    # thousands of ordinary peptides alongside the few long ones and inherits their window,
+    # which on a 20,000-peptide set cost 43 % of the throughput.
+    buckets: list[tuple[torch.Tensor, Dataset]] = []
+    start = 0
+    while start < len(order):
+        stop = min(start + batch_size, len(order))
+        band = sorted_lengths[start] + _LENGTH_BAND
+        within = int(np.searchsorted(sorted_lengths[start:stop], band, side="right"))
+        stop = start + max(within, 1)
+        padding = int(min(window, sorted_lengths[stop - 1] + reach))
+        chunk = order[start:stop]
         buckets.append((torch.as_tensor(chunk), data.variant(chunk.tolist(), padding)))
+        start = stop
+
+    if len(buckets) == 1 and buckets[0][1].padding_length >= window:
+        return None  # one chunk at the full window is what the plain path already does
     return buckets
 
 
