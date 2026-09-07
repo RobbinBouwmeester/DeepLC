@@ -15,8 +15,9 @@ from deeplc import _model_ops
 from deeplc._reference_selection import deduplicate_psms, select_reference_psms
 from deeplc.calibration import (
     Calibration,
+    MultiHeadCalibration,
     MultiHeadRidgeCalibration,
-    SplineTransformerCalibration,
+    upgrade_calibration,
 )
 from deeplc.data import DeepLCDataset, split_datasets
 
@@ -142,11 +143,11 @@ def _default_task_idx(model: torch.nn.Module) -> int:
 def calibrate(
     psm_list_reference: PSMList,
     model: torch.nn.Module | PathLike | str | None = None,
-    calibration: Calibration | None = None,
+    calibration: Calibration | MultiHeadCalibration | None = None,
     predict_kwargs: dict | None = None,
-) -> Calibration:
+) -> MultiHeadCalibration:
     """
-    Return a `Calibration` instance fitted to the reference dataset.
+    Return a `MultiHeadCalibration` instance fitted to the reference dataset.
 
     Parameters
     ----------
@@ -155,15 +156,19 @@ def calibrate(
     model
         Trained model or path to model file.
     calibration
-        Calibration instance to use. If None, a multitask model gets
-        MultiHeadRidgeCalibration (combining the best-correlating setup heads) and a
-        single-task model gets SplineTransformerCalibration.
+        Calibration instance to use. If None, MultiHeadRidgeCalibration is used. A model with a
+        single LC setup still predicts a one-column matrix, so this default also covers
+        single-task models. See ``deeplc.calibration.multihead`` for lighter alternatives (e.g.
+        ``MultiHeadSplineCalibration``) when the ridge over many heads isn't the right fit, for
+        example for a custom, non-multitask model. An unfitted naive
+        :class:`~deeplc.calibration.simple.Calibration` is accepted too and upgraded to its
+        ``MultiHead*Calibration`` counterpart; see :func:`deeplc.calibration.upgrade_calibration`.
     predict_kwargs
         Additional keyword arguments to pass to the prediction function.
 
     Returns
     -------
-    Calibration
+    MultiHeadCalibration
         Fitted calibration instance.
 
     """
@@ -171,16 +176,17 @@ def calibrate(
     # peptidoform once per spectrum it was identified in, each time with a different observed
     # retention time, which gives the fit conflicting targets and weighs peptidoforms by how
     # often they happened to be identified. A caller who wants the repeats to count fits a
-    # Calibration itself and passes it in already fitted.
+    # MultiHeadCalibration itself and passes it in already fitted.
     psm_list_reference = deduplicate_psms(psm_list_reference)
 
-    if calibration is not None and not isinstance(calibration, Calibration):
-        raise ValueError(
-            f"Expected calibration to be of type `Calibration`, got {type(calibration)}"
-        )
-    if calibration is not None and calibration.is_fitted:
+    if calibration is None:
+        LOGGER.debug("No calibration provided, using MultiHeadRidgeCalibration by default.")
+        calibration = MultiHeadRidgeCalibration()
+    else:
+        calibration = upgrade_calibration(calibration)
+    if calibration.is_fitted:
         LOGGER.warning(
-            "Provided Calibration is already fitted. Refitting will overwrite existing fit."
+            "Provided calibration is already fitted. Refitting will overwrite existing fit."
         )
 
     if any(psm_list_reference["is_decoy"]):
@@ -198,30 +204,11 @@ def calibrate(
         return_matrix=True,
     )
 
-    # The default depends on the model: a multitask model is calibrated against its
-    # best-correlating setup heads combined, a single-task model against its one output.
-    if calibration is None:
-        if source_rt_cal.shape[1] > 1:
-            calibration = MultiHeadRidgeCalibration()
-        else:
-            calibration = SplineTransformerCalibration()
-        LOGGER.debug("No calibration provided, using %s.", type(calibration).__name__)
-
-    # Fit calibration
+    # Fit calibration; every MultiHeadCalibration takes the whole matrix and selects its own
+    # head(s), setting selected_model_head itself for callers that want to know which setup came
+    # out on top.
     LOGGER.debug("Fitting calibration...")
     target_rt_cal = np.array(psm_list_reference["retention_time"], dtype=np.float32)
-
-    # A calibration that combines heads is given the whole matrix and picks its own; it sets
-    # selected_model_head itself, for callers that want to know which setup came out on top.
-    if getattr(calibration, "uses_all_heads", False):
-        calibration.fit(target=target_rt_cal, source=source_rt_cal)
-        return calibration
-
-    # Select the best head for calibration if the model predicts for multiple LC setups
-    if source_rt_cal.shape[1] > 1:
-        calibration.selected_model_head = _best_correlating_head(source_rt_cal, target_rt_cal)
-    source_rt_cal = source_rt_cal[:, calibration.selected_model_head or 0]
-
     calibration.fit(target=target_rt_cal, source=source_rt_cal)
 
     return calibration
@@ -231,7 +218,7 @@ def predict_and_calibrate(
     psm_list: PSMList | list[PSM | Peptidoform | str],
     psm_list_reference: PSMList | list[PSM | Peptidoform | str] | None = None,
     model: torch.nn.Module | PathLike | str | None = None,
-    calibration: Calibration | None = None,
+    calibration: Calibration | MultiHeadCalibration | None = None,
     predict_kwargs: dict | None = None,
 ) -> np.ndarray:
     """
@@ -249,9 +236,12 @@ def predict_and_calibrate(
     model
         Trained model or path to model file.
     calibration
-        Calibration instance to use. If None, a multitask model gets
-        MultiHeadRidgeCalibration (combining the best-correlating setup heads) and a
-        single-task model gets SplineTransformerCalibration.
+        Calibration instance to use. If None, MultiHeadRidgeCalibration is used. See
+        ``deeplc.calibration.multihead`` for lighter alternatives. An unfitted naive
+        :class:`~deeplc.calibration.simple.Calibration` is accepted too and upgraded to its
+        ``MultiHead*Calibration`` counterpart; see :func:`deeplc.calibration.upgrade_calibration`.
+        A fitted one is not, since it carries no record of which head it was fit on: fit a
+        ``MultiHead*Calibration`` instead to pass in an already fitted calibration.
     predict_kwargs
         Additional keyword arguments to pass to the prediction function.
 
@@ -278,10 +268,8 @@ def predict_and_calibrate(
         return_matrix=True,
     )
 
-    if calibration is not None and not isinstance(calibration, Calibration):
-        raise ValueError(
-            f"Expected calibration to be of type `Calibration`, got {type(calibration)}"
-        )
+    if calibration is not None:
+        calibration = upgrade_calibration(calibration)
 
     # Fit calibration if not already fitted
     if calibration is None or not calibration.is_fitted:
@@ -294,25 +282,8 @@ def predict_and_calibrate(
     else:
         LOGGER.info("Calibration is already fitted, skipping fitting step.")
 
-    if getattr(calibration, "uses_all_heads", False):
-        # the calibration combines several heads, so it takes the matrix as it is
-        return calibration.transform(predicted_rt)
-
-    if predicted_rt.shape[1] > 1:
-        if calibration.selected_model_head is None:
-            raise ValueError(
-                "Calibration has no selected_model_head. Either use calibrate() to fit it, "
-                "or set calibration.selected_model_head manually before calling "
-                "predict_and_calibrate() with a multitask model."
-            )
-        predicted_rt = predicted_rt[:, calibration.selected_model_head]
-    else:
-        predicted_rt = predicted_rt[:, 0]
-
-    # Apply calibration to predictions
-    calibrated_rt = calibration.transform(predicted_rt)
-
-    return calibrated_rt
+    # Every MultiHeadCalibration selects its own head(s), so it takes the matrix as it is.
+    return calibration.transform(predicted_rt)
 
 
 def finetune_and_predict(
@@ -368,9 +339,10 @@ def finetune_and_predict(
         psm_list=parsed_psm_list,
         model=finetuned_model,
         predict_kwargs=predict_kwargs,
+        return_matrix=True,
     )
 
-    # Fit calibration with simple PiecewiseLinearCalibration to the fine-tuned model predictions
+    # Fit calibration to the fine-tuned model predictions
     LOGGER.info("Fitting calibration with fine-tuned model predictions...")
     calibration = calibrate(
         psm_list_reference=parsed_psm_list_ref,
@@ -736,25 +708,3 @@ def _parse_psms(psm_list: PSMList | list[PSM | Peptidoform | str]) -> PSMList:
             raise ValueError("List must contain either PSMs, Peptidoforms, or strings.")
     else:
         raise ValueError("Input must be a PSMList or a list of PSMs, Peptidoforms, or strings.")
-
-
-def _best_correlating_head(predictions: np.ndarray, targets: np.ndarray) -> int:
-    """Return the head index with highest valid Pearson correlation to targets."""
-    best_idx = 0
-    best_corr = float("-inf")
-
-    for idx in range(predictions.shape[1]):
-        pred_col = predictions[:, idx]
-        mask = np.isfinite(pred_col) & np.isfinite(targets)
-        if mask.sum() < 3:
-            continue
-        pred_masked = pred_col[mask]
-        target_masked = targets[mask]
-        if np.std(pred_masked) < 1e-8 or np.std(target_masked) < 1e-8:
-            continue
-        corr = np.corrcoef(pred_masked, target_masked)[0, 1]
-        if np.isfinite(corr) and corr > best_corr:
-            best_corr = corr
-            best_idx = idx
-
-    return best_idx

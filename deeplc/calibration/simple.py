@@ -1,4 +1,11 @@
-"""Calibration utilities."""
+"""
+Naive calibration utilities.
+
+Every class here maps a single series of raw predictions onto a single series of observed
+values: ``fit(target: (n,), source: (n,))`` / ``transform(source: (n,)) -> (n,)``. None of them
+know about multitask models or LC-setup heads; see :mod:`deeplc.calibration.multihead` for the
+classes that select a head from a ``(n, n_heads)`` prediction matrix and delegate to one of these.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +14,7 @@ from abc import ABC, abstractmethod
 from typing import cast
 
 import numpy as np
-from sklearn.linear_model import LinearRegression, RidgeCV  # type: ignore[import]
+from sklearn.linear_model import LinearRegression  # type: ignore[import]
 from sklearn.pipeline import Pipeline, make_pipeline  # type: ignore[import]
 from sklearn.preprocessing import SplineTransformer  # type: ignore[import]
 
@@ -17,13 +24,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class Calibration(ABC):
-    """Abstract base class for calibration."""
-
-    selected_model_head: int | None = None
-
-    #: Whether ``fit`` and ``transform`` take the full ``(n, n_heads)`` prediction matrix
-    #: instead of a single series.
-    uses_all_heads: bool = False
+    """Abstract base class for a single-series calibration."""
 
     @abstractmethod
     def __init__(self, *args, **kwargs):
@@ -49,6 +50,10 @@ class Calibration(ABC):
 
 class IdentityCalibration(Calibration):
     """No calibration; returns inputs unchanged."""
+
+    def __init__(self) -> None:
+        """Initialize IdentityCalibration."""
+        super().__init__()
 
     @property
     def is_fitted(self) -> bool:
@@ -327,146 +332,6 @@ class SplineTransformerCalibration(Calibration):
             ~within_range & (source.ravel() > calibrate_max)
         ]
         return np.array(cal_preds)
-
-
-class MultiHeadRidgeCalibration(Calibration):
-    """
-    Calibrate a multitask model against several of its LC-setup heads at once.
-
-    Heads are ranked by Pearson correlation to the reference, the ``n_heads`` best are each
-    calibrated with :class:`SplineTransformerCalibration`, and a ridge regression maps the
-    calibrated estimates onto the observed retention times. Never fits more head weights than
-    half the reference size. For a single-task model (one head) this reduces to a spline
-    followed by a linear rescaling.
-
-    Parameters
-    ----------
-    n_heads
-        How many of the best-correlating heads to combine.
-    alphas
-        Ridge strengths offered to the internal cross-validation.
-
-    """
-
-    uses_all_heads = True
-
-    def __init__(self, n_heads: int = 80, alphas: np.ndarray | None = None) -> None:
-        """Initialize MultiHeadRidgeCalibration."""
-        super().__init__()
-        if n_heads < 1:
-            raise ValueError(f"n_heads must be at least 1, got {n_heads}")
-        self.n_heads = n_heads
-        self.alphas = np.logspace(-3, 6, 19) if alphas is None else np.asarray(alphas)
-        self._head_idx: np.ndarray | None = None
-        self._head_calibrations: list[SplineTransformerCalibration] = []
-        self._ridge = None
-
-    @property
-    def is_fitted(self) -> bool:
-        """True once the heads are selected, calibrated and weighted."""
-        return self._head_idx is not None and self._ridge is not None
-
-    def fit(self, target: np.ndarray, source: np.ndarray) -> None:
-        """
-        Select, calibrate and weight the heads.
-
-        Parameters
-        ----------
-        target
-            Observed retention times of the reference, shape ``(n,)``.
-        source
-            Reference predictions for every head, shape ``(n, n_heads_total)``. A 1-D array is
-            accepted and treated as a single head, so a single-task model still works.
-
-        """
-        source = np.asarray(source, dtype=np.float64)
-        if source.ndim == 1:
-            source = source[:, None]
-        target = np.asarray(target, dtype=np.float64).ravel()
-        if source.shape[0] != target.shape[0]:
-            raise CalibrationError(
-                f"source has {source.shape[0]} rows and target {target.shape[0]}"
-            )
-        finite = np.isfinite(target) & np.isfinite(source).all(axis=1)
-        if int(finite.sum()) < 3:
-            raise CalibrationError("Fewer than three reference points with finite values.")
-        source, target = source[finite], target[finite]
-
-        order = _rank_heads_by_correlation(source, target)
-        # never fit more weights than half the reference: a 230-peptide reference cannot support
-        # eighty of them, and the ridge would be extrapolating its own regularisation
-        n_heads = int(min(self.n_heads, source.shape[1], max(1, len(target) // 2)))
-        self._head_idx = order[:n_heads]
-        self.selected_model_head = int(order[0])
-
-        calibrated = np.empty((len(target), n_heads), dtype=np.float64)
-        self._head_calibrations = []
-        for position, head in enumerate(self._head_idx):
-            head_calibration = SplineTransformerCalibration()
-            column = source[:, head].astype(np.float32)
-            head_calibration.fit(target=target.astype(np.float32), source=column)
-            calibrated[:, position] = np.asarray(
-                head_calibration.transform(column), dtype=np.float64
-            )
-            self._head_calibrations.append(head_calibration)
-
-        n_splits = int(min(5, max(2, len(target) // 20)))
-        self._ridge = RidgeCV(alphas=self.alphas, cv=n_splits).fit(calibrated, target)
-        LOGGER.info(
-            "Calibrated on %d of %d heads with ridge strength %.4g; head %d correlates best.",
-            n_heads,
-            source.shape[1],
-            float(getattr(self._ridge, "alpha_", float("nan"))),
-            self.selected_model_head,
-        )
-
-    def transform(self, source: np.ndarray) -> np.ndarray:
-        """
-        Calibrate predictions of the model this calibration was fitted with.
-
-        Parameters
-        ----------
-        source
-            Predictions for every head, shape ``(n, n_heads_total)``, as returned by
-            ``predict(..., return_matrix=True)``.
-
-        """
-        if not self.is_fitted:
-            raise CalibrationError("The model has not been fitted yet. Call fit() first.")
-        source = np.asarray(source, dtype=np.float64)
-        if source.ndim == 1:
-            source = source[:, None]
-        head_idx = cast(np.ndarray, self._head_idx)
-        if source.shape[1] <= int(head_idx.max()):
-            raise CalibrationError(
-                f"source has {source.shape[1]} heads, but the calibration was fitted on a model "
-                f"with at least {int(head_idx.max()) + 1}."
-            )
-        if source.shape[0] == 0:
-            return np.array([])
-        calibrated = np.column_stack(
-            [
-                np.asarray(cal.transform(source[:, head].astype(np.float32)), dtype=np.float64)
-                for cal, head in zip(self._head_calibrations, head_idx, strict=True)
-            ]
-        )
-        return np.asarray(self._ridge.predict(calibrated), dtype=np.float64)
-
-
-def _rank_heads_by_correlation(source: np.ndarray, target: np.ndarray) -> np.ndarray:
-    """
-    Head indices by decreasing Pearson correlation with the target, in one pass.
-
-    The same criterion as :func:`deeplc.core._best_correlating_head`, which takes the first
-    element of this order, but vectorised because thousands of heads are ranked at once.
-    """
-    centred = source - source.mean(axis=0)
-    target_centred = target - target.mean()
-    with np.errstate(invalid="ignore", divide="ignore"):
-        denominator = np.sqrt((centred**2).sum(axis=0) * (target_centred**2).sum())
-        correlation = (centred * target_centred[:, None]).sum(axis=0) / denominator
-    correlation = np.where(np.isfinite(correlation), correlation, -np.inf)
-    return np.argsort(-correlation)
 
 
 def _prepare_series(

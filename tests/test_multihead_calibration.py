@@ -7,7 +7,17 @@ import pytest
 from psm_utils import PSM, PSMList
 
 from deeplc import core
-from deeplc.calibration import MultiHeadRidgeCalibration, SplineTransformerCalibration
+from deeplc.calibration import (
+    Calibration,
+    IdentityCalibration,
+    MultiHeadCalibration,
+    MultiHeadPiecewiseLinearCalibration,
+    MultiHeadRidgeCalibration,
+    MultiHeadSplineCalibration,
+    PiecewiseLinearCalibration,
+    SplineTransformerCalibration,
+    upgrade_calibration,
+)
 from deeplc.exceptions import CalibrationError
 
 _PEPTIDES = [
@@ -21,6 +31,12 @@ _PEPTIDES = [
     "AAPFSPAEK",
     "VGAHAGEYGAEALER",
     "LNLSPLGEEMR",
+]
+
+#: (multi-head class, plain single-series class it wraps), for the shared behavioral tests below.
+_SELECTOR_CLASSES = [
+    (MultiHeadPiecewiseLinearCalibration, PiecewiseLinearCalibration),
+    (MultiHeadSplineCalibration, SplineTransformerCalibration),
 ]
 
 
@@ -42,10 +58,13 @@ def _synthetic(n: int = 200, n_heads: int = 12, seed: int = 0):
     return target, source
 
 
-def test_declares_that_it_takes_the_whole_matrix():
-    """The flag is what makes core hand over every head instead of one column."""
-    assert MultiHeadRidgeCalibration().uses_all_heads is True
-    assert SplineTransformerCalibration().uses_all_heads is False
+def test_multihead_calibrations_share_a_common_type():
+    """`core` dispatches on this type; every head-selecting calibration must be one."""
+    assert isinstance(MultiHeadRidgeCalibration(), MultiHeadCalibration)
+    assert isinstance(MultiHeadPiecewiseLinearCalibration(), MultiHeadCalibration)
+    assert isinstance(MultiHeadSplineCalibration(), MultiHeadCalibration)
+    assert not isinstance(SplineTransformerCalibration(), MultiHeadCalibration)
+    assert not isinstance(PiecewiseLinearCalibration(), MultiHeadCalibration)
 
 
 def test_beats_a_single_head_when_the_target_mixes_two():
@@ -129,6 +148,81 @@ def test_empty_source_returns_empty():
     assert calibration.transform(np.zeros((0, source.shape[1]))).shape == (0,)
 
 
+@pytest.mark.parametrize(("selector_cls", "inner_cls"), _SELECTOR_CLASSES)
+def test_selector_matches_a_manual_fit_of_its_inner_calibration(
+    selector_cls: type[MultiHeadCalibration], inner_cls: type[Calibration]
+):
+    """The wrapper picks a head and defers to its inner calibration, nothing more."""
+    target, source = _synthetic()
+    selector = selector_cls()
+    selector.fit(target=target, source=source)
+    assert selector.selected_model_head in (0, 1)
+
+    inner = inner_cls()
+    head_column = source[:, selector.selected_model_head]
+    inner.fit(target=target, source=head_column)
+
+    # Exclude the exact extreme points: SplineTransformerCalibration switches between the spline
+    # and its linear trail model right at the fitted min/max, so a sub-ULP float32 rounding
+    # difference there can flip the branch and jump the output. That instability is inherent to
+    # the wrapped calibration, not something the selector introduces.
+    not_extreme = (head_column != head_column.min()) & (head_column != head_column.max())
+    np.testing.assert_allclose(
+        selector.transform(source)[not_extreme],
+        inner.transform(head_column)[not_extreme],
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@pytest.mark.parametrize(("selector_cls", "_inner_cls"), _SELECTOR_CLASSES)
+def test_selector_is_fitted_and_transform_guard(selector_cls, _inner_cls):
+    """Transforming before fitting is an error, not silent nonsense."""
+    calibration = selector_cls()
+    assert not calibration.is_fitted
+    with pytest.raises(CalibrationError, match="not been fitted"):
+        calibration.transform(np.zeros((3, 5)))
+
+
+@pytest.mark.parametrize(("selector_cls", "_inner_cls"), _SELECTOR_CLASSES)
+def test_selector_rejects_a_model_with_fewer_heads_than_it_was_fitted_on(selector_cls, _inner_cls):
+    """A calibration is tied to the model it was fitted on."""
+    target, source = _synthetic(n_heads=12)
+    calibration = selector_cls()
+    calibration.fit(target=target, source=source)
+    with pytest.raises(CalibrationError, match="heads"):
+        # 0 columns is fewer than the fitted head's index whichever head that turned out to be.
+        calibration.transform(source[:, :0])
+
+
+@pytest.mark.parametrize(("selector_cls", "_inner_cls"), _SELECTOR_CLASSES)
+def test_selector_single_head_input_is_accepted(selector_cls, _inner_cls):
+    """A single-task model gives a 1-D series; the calibration still works."""
+    target, source = _synthetic(n_heads=1)
+    calibration = selector_cls()
+    calibration.fit(target=target, source=source[:, 0])
+    out = calibration.transform(source[:, 0])
+    assert out.shape == target.shape
+    assert np.isfinite(out).all()
+
+
+@pytest.mark.parametrize(("selector_cls", "_inner_cls"), _SELECTOR_CLASSES)
+def test_selector_too_few_finite_points(selector_cls, _inner_cls):
+    """Two points cannot support a fit."""
+    calibration = selector_cls()
+    with pytest.raises(CalibrationError, match="three reference points"):
+        calibration.fit(target=np.array([1.0, np.nan]), source=np.zeros((2, 4)))
+
+
+@pytest.mark.parametrize(("selector_cls", "_inner_cls"), _SELECTOR_CLASSES)
+def test_selector_empty_source_returns_empty(selector_cls, _inner_cls):
+    """No PSMs in, no predictions out."""
+    target, source = _synthetic()
+    calibration = selector_cls()
+    calibration.fit(target=target, source=source)
+    assert calibration.transform(np.zeros((0, source.shape[1]))).shape == (0,)
+
+
 def _psm_list(rts: list[float] | None = None) -> PSMList:
     return PSMList(
         psm_list=[
@@ -177,13 +271,81 @@ def test_default_calibration_combines_heads_for_the_multitask_model():
     assert calibration.selected_model_head is not None
 
 
-def test_single_head_calibration_remains_available():
-    """Passing SplineTransformerCalibration restores the one-head behaviour."""
+def test_lighter_calibration_can_be_passed_explicitly():
+    """Passing MultiHeadSplineCalibration opts out of the ridge combination."""
+    reference = _psm_list([5.0 + 3.0 * i for i in range(len(_PEPTIDES))])
+    calibration = core.calibrate(
+        reference,
+        calibration=MultiHeadSplineCalibration(),
+        predict_kwargs={"device": "cpu"},
+    )
+    assert isinstance(calibration, MultiHeadSplineCalibration)
+    assert calibration.selected_model_head is not None
+
+
+def test_upgrade_calibration_returns_a_multihead_instance_unchanged():
+    """A MultiHeadCalibration is not touched: nothing to upgrade."""
+    calibration = MultiHeadRidgeCalibration(n_heads=3)
+    assert upgrade_calibration(calibration) is calibration
+
+
+def test_upgrade_calibration_wraps_a_naive_spline_calibration():
+    """A naive SplineTransformerCalibration becomes a MultiHeadSplineCalibration."""
+    upgraded = upgrade_calibration(SplineTransformerCalibration())
+    assert isinstance(upgraded, MultiHeadSplineCalibration)
+    assert not upgraded.is_fitted
+
+
+def test_upgrade_calibration_carries_over_piecewise_linear_parameters():
+    """The wrapped PiecewiseLinearCalibration keeps the constructor arguments it was given."""
+    naive = PiecewiseLinearCalibration(number_of_splits=25, use_median=True)
+    upgraded = upgrade_calibration(naive)
+    assert isinstance(upgraded, MultiHeadPiecewiseLinearCalibration)
+    assert upgraded._inner.number_of_splits == 25
+    assert upgraded._inner.use_median is True
+
+
+def test_upgrade_calibration_rejects_an_already_fitted_naive_calibration():
+    """A fitted naive calibration carries no record of which head it was fit on."""
+    naive = SplineTransformerCalibration()
+    naive.fit(target=np.linspace(0, 10, 50), source=np.linspace(0, 10, 50))
+    with pytest.raises(CalibrationError, match="fitted, naive Calibration"):
+        upgrade_calibration(naive)
+
+
+def test_upgrade_calibration_rejects_a_calibration_with_no_multihead_counterpart():
+    """IdentityCalibration has no MultiHead* counterpart; upgrading it is a clear error."""
+    with pytest.raises(ValueError, match="No MultiHeadCalibration counterpart"):
+        upgrade_calibration(IdentityCalibration())
+
+
+def test_upgrade_calibration_rejects_a_nonsensical_type():
+    """Neither a Calibration nor a MultiHeadCalibration cannot be upgraded."""
+    with pytest.raises(ValueError, match="Expected calibration to be of type"):
+        upgrade_calibration(object())
+
+
+def test_core_accepts_an_unfitted_naive_calibration_for_backward_compatibility():
+    """`calibrate()` upgrades a plain SplineTransformerCalibration instead of rejecting it."""
     reference = _psm_list([5.0 + 3.0 * i for i in range(len(_PEPTIDES))])
     calibration = core.calibrate(
         reference,
         calibration=SplineTransformerCalibration(),
         predict_kwargs={"device": "cpu"},
     )
-    assert calibration.uses_all_heads is False
-    assert calibration.selected_model_head is not None
+    assert isinstance(calibration, MultiHeadSplineCalibration)
+    assert calibration.is_fitted
+
+
+def test_core_rejects_a_fitted_naive_calibration():
+    """predict_and_calibrate() cannot recover the head a naive calibration was fit on."""
+    reference = _psm_list([5.0 + 3.0 * i for i in range(len(_PEPTIDES))])
+    naive = SplineTransformerCalibration()
+    naive.fit(target=np.array([5.0 + 3.0 * i for i in range(len(_PEPTIDES))]), source=np.zeros(10))
+    with pytest.raises(CalibrationError, match="fitted, naive Calibration"):
+        core.predict_and_calibrate(
+            _psm_list(),
+            psm_list_reference=reference,
+            calibration=naive,
+            predict_kwargs={"device": "cpu"},
+        )
