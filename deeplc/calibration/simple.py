@@ -318,20 +318,19 @@ class SplineTransformerCalibration(Calibration):
         if source.shape[0] == 0:
             return np.array([])
 
-        y_pred_spline = model_main.predict(source.reshape(-1, 1))
-        y_pred_left = model_left.predict(source.reshape(-1, 1))
-        y_pred_right = model_right.predict(source.reshape(-1, 1))
-        within_range = (source >= calibrate_min) & (source <= calibrate_max)
-        within_range = within_range.ravel()
+        flat = source.ravel()
+        cal_preds = np.asarray(model_main.predict(source.reshape(-1, 1)), dtype=float)
 
-        cal_preds = np.copy(y_pred_spline)
-        cal_preds[~within_range & (source.ravel() < calibrate_min)] = y_pred_left[
-            ~within_range & (source.ravel() < calibrate_min)
-        ]
-        cal_preds[~within_range & (source.ravel() > calibrate_max)] = y_pred_right[
-            ~within_range & (source.ravel() > calibrate_max)
-        ]
-        return np.array(cal_preds)
+        # The trails only ever supply the points outside the fitted range, which on a
+        # reference that covers its own gradient is usually none of them. Predicting them
+        # for every point tripled the work of this method.
+        below = flat < calibrate_min
+        above = flat > calibrate_max
+        if below.any():
+            cal_preds[below] = model_left.predict(flat[below].reshape(-1, 1))
+        if above.any():
+            cal_preds[above] = model_right.predict(flat[above].reshape(-1, 1))
+        return cal_preds
 
 
 def _prepare_series(
