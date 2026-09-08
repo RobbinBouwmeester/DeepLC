@@ -34,14 +34,18 @@ def take_columns(source, indices: Sequence[int]) -> np.ndarray:
     Take the named head columns from a source, as float64 of shape ``(n, len(indices))``.
 
     The source is normally the ``(n, n_heads)`` matrix a model returned. It may instead be an
-    object offering ``columns(indices)``, such as :class:`deeplc.core.HeadColumnSource`, which
-    evaluates only the heads asked for: a calibration reads a few dozen of the thousands a
-    multitask model has, and at 6,543 setups the unread columns are 26 kB per peptide. Which
+    object offering ``head_columns(indices)``, such as :class:`deeplc.core.HeadColumnSource`,
+    which evaluates only the heads asked for: a calibration reads a few dozen of the thousands
+    a multitask model has, and at 6,543 setups the unread columns are 26 kB per peptide. Which
     of the two it is makes no difference to a calibration, and the caller hands over the same
     thing either way.
+
+    The method is called ``head_columns`` rather than ``columns`` because a pandas DataFrame
+    has a ``columns`` attribute, and a caller passing one deserves to have it read as a matrix
+    rather than mistaken for a lazy provider.
     """
-    if hasattr(source, "columns"):
-        taken = source.columns(indices)
+    if callable(getattr(source, "head_columns", None)):
+        taken = source.head_columns(indices)
     else:
         matrix = np.asarray(source)
         if matrix.ndim == 1:
@@ -51,8 +55,21 @@ def take_columns(source, indices: Sequence[int]) -> np.ndarray:
 
 
 def source_shape(source) -> tuple[int, int]:
-    """Rows and head count of a source, without materialising a lazy one."""
-    shape = tuple(source.shape)
+    """
+    Give the rows and head count of a source, without materialising a lazy one.
+
+    Anything array-like is accepted, a list of predictions included: ``transform`` used to
+    coerce its argument with ``np.asarray`` before reading a shape off it, and that let
+    callers pass whatever numpy would take. A source that reports its own shape, such as a
+    lazy column provider, is asked rather than converted. A one-dimensional source is one
+    head, which is what a single-task model returns.
+    """
+    shape = getattr(source, "shape", None)
+    if shape is None:
+        shape = np.asarray(source).shape
+    shape = tuple(shape)
+    if not shape:
+        raise CalibrationError("source has no rows to calibrate")
     return (shape[0], shape[1] if len(shape) > 1 else 1)
 
 

@@ -264,7 +264,7 @@ class HeadColumnSource:
         """Always two: this stands in for a matrix."""
         return 2
 
-    def columns(self, indices) -> np.ndarray:
+    def head_columns(self, indices) -> np.ndarray:
         """Predictions for the given heads, shape ``(n, len(indices))``, in that order."""
         wanted = tuple(int(i) for i in indices)
         # Callers ask for the same heads more than once - prediction_report transforms the

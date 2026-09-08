@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 from psm_utils import PSM, PSMList
 
@@ -397,7 +398,7 @@ class _CountingSource:
     def ndim(self):
         return 2
 
-    def columns(self, indices) -> np.ndarray:
+    def head_columns(self, indices) -> np.ndarray:
         wanted = tuple(int(i) for i in indices)
         self.requests.append(wanted)
         return self._matrix[:, list(wanted)]
@@ -442,3 +443,32 @@ def test_column_source_serves_the_disagreement_too():
         calibration.disagreement(query),
         atol=1e-8,
     )
+
+
+@pytest.mark.parametrize("wrap", [
+    pytest.param(lambda column: column[:, None], id="2-D array"),
+    pytest.param(lambda column: column, id="1-D array"),
+    pytest.param(lambda column: [float(v) for v in column], id="list"),
+    pytest.param(lambda column: tuple(float(v) for v in column), id="tuple"),
+    pytest.param(lambda column: column.astype(int), id="int array"),
+    pytest.param(lambda column: pd.Series(column), id="pandas Series"),
+    pytest.param(lambda column: pd.DataFrame({"head": column}), id="pandas DataFrame"),
+])
+def test_transform_takes_whatever_numpy_takes(wrap):
+    """
+    Every array-like a caller could hand to transform keeps working.
+
+    ``transform`` used to coerce its argument with ``np.asarray(source, dtype=np.float64)``
+    before touching it, which quietly accepted a list, a tuple, a one-dimensional array from a
+    single-task model, or an integer dtype. Reading the shape off the source directly, so a
+    lazy provider is not materialised, must not withdraw that.
+    """
+    rng = np.random.RandomState(3)
+    source = rng.randn(120, 1) * 5 + 40
+    calibration = MultiHeadRidgeCalibration(n_heads=1)
+    calibration.fit(source[:, 0] * 1.1 + 2, source)
+
+    column = rng.randn(10) * 5 + 40
+    out = calibration.transform(wrap(column))
+    assert np.shape(out) == (10,)
+    assert np.isfinite(out).all()
