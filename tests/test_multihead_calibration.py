@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 from psm_utils import PSM, PSMList
 
@@ -125,6 +126,37 @@ def test_never_fits_more_weights_than_half_the_reference():
     calibration = MultiHeadRidgeCalibration(n_heads=80)
     calibration.fit(target=target, source=source)
     assert len(calibration._head_calibrations) <= 5
+
+
+def test_disagreement_is_per_input_and_zero_only_when_heads_agree():
+    """The spread of the calibrated heads varies from input to input."""
+    target, source = _synthetic(n_heads=12)
+    calibration = MultiHeadRidgeCalibration(n_heads=6)
+    assert calibration.disagreement(source) is None  # unfitted
+    calibration.fit(target=target, source=source)
+
+    spread = calibration.disagreement(source)
+    assert spread.shape == target.shape
+    assert (spread >= 0).all()
+    assert np.unique(spread.round(9)).size > len(target) // 2
+
+    # heads that are affine views of one latent retention time calibrate onto each other, so
+    # after calibration they agree and the spread collapses
+    rng = np.random.default_rng(0)
+    latent = rng.uniform(0, 100, len(target))
+    scales, shifts = rng.uniform(0.5, 2, 12), rng.uniform(-20, 20, 12)
+    agreeing = latent[:, None] * scales + shifts
+    agreed = MultiHeadRidgeCalibration(n_heads=6)
+    agreed.fit(target=latent, source=agreeing)
+    assert agreed.disagreement(agreeing).mean() < 0.05 * spread.mean()
+
+
+def test_single_head_combination_reports_no_disagreement():
+    """One head carries no spread, so there is nothing to scale an interval by."""
+    target, source = _synthetic(n_heads=1)
+    calibration = MultiHeadRidgeCalibration()
+    calibration.fit(target=target, source=source[:, 0])
+    assert calibration.disagreement(source[:, 0]) is None
 
 
 def test_rejects_a_nonsensical_head_count():
@@ -349,3 +381,99 @@ def test_core_rejects_a_fitted_naive_calibration():
             calibration=naive,
             predict_kwargs={"device": "cpu"},
         )
+
+
+class _CountingSource:
+    """A head source that records which heads were asked for, and refuses to be materialised."""
+
+    is_head_source = True
+
+    def __init__(self, matrix: np.ndarray):
+        self._matrix = matrix
+        self.requests: list[tuple[int, ...]] = []
+
+    @property
+    def shape(self):
+        return self._matrix.shape
+
+    @property
+    def ndim(self):
+        return 2
+
+    def __getitem__(self, key) -> np.ndarray:
+        rows, heads = key
+        assert isinstance(rows, slice) and rows == slice(None)
+        wanted = (int(heads),) if np.isscalar(heads) else tuple(int(i) for i in heads)
+        self.requests.append(wanted)
+        taken = self._matrix[:, list(wanted)]
+        return taken[:, 0] if np.isscalar(heads) else taken
+
+    def __array__(self, dtype=None, copy=None):
+        raise AssertionError("the whole matrix should not be materialised")
+
+
+def test_column_source_matches_a_matrix():
+    """
+    A calibration must not care whether its source is a matrix or a column provider.
+
+    That equivalence is what lets the caller hand over one source and never branch on the
+    calibration, while a multitask model evaluates only the heads that get read.
+    """
+    rng = np.random.RandomState(0)
+    source = rng.randn(200, 300) * 5 + 40
+    target = source[:, 11] * 1.1 + 2 + rng.randn(200) * 0.1
+    query = rng.randn(40, 300) * 5 + 40
+
+    for calibration in (MultiHeadRidgeCalibration(n_heads=12), SplineTransformerCalibration()):
+        fitted = upgrade_calibration(calibration)
+        fitted.fit(target, source)
+        lazy = _CountingSource(query)
+        np.testing.assert_allclose(fitted.transform(lazy), fitted.transform(query), atol=1e-8)
+        # every read is one request for all the heads that calibration uses
+        assert len(lazy.requests) == 1
+        assert len(lazy.requests[0]) == len(getattr(fitted, "_head_idx", [0]))
+
+
+def test_column_source_serves_the_disagreement_too():
+    """The per-peptide spread reads the same columns, so it works off a lazy source as well."""
+    rng = np.random.RandomState(1)
+    source = rng.randn(200, 120) * 5 + 40
+    target = source[:, 3] * 0.9 + 1 + rng.randn(200) * 0.2
+    query = rng.randn(30, 120) * 5 + 40
+
+    calibration = MultiHeadRidgeCalibration(n_heads=10)
+    calibration.fit(target, source)
+    np.testing.assert_allclose(
+        calibration.disagreement(_CountingSource(query)),
+        calibration.disagreement(query),
+        atol=1e-8,
+    )
+
+
+@pytest.mark.parametrize("wrap", [
+    pytest.param(lambda column: column[:, None], id="2-D array"),
+    pytest.param(lambda column: column, id="1-D array"),
+    pytest.param(lambda column: [float(v) for v in column], id="list"),
+    pytest.param(lambda column: tuple(float(v) for v in column), id="tuple"),
+    pytest.param(lambda column: column.astype(int), id="int array"),
+    pytest.param(lambda column: pd.Series(column), id="pandas Series"),
+    pytest.param(lambda column: pd.DataFrame({"head": column}), id="pandas DataFrame"),
+])
+def test_transform_takes_whatever_numpy_takes(wrap):
+    """
+    Every array-like a caller could hand to transform keeps working.
+
+    ``transform`` used to coerce its argument with ``np.asarray(source, dtype=np.float64)``
+    before touching it, which quietly accepted a list, a tuple, a one-dimensional array from a
+    single-task model, or an integer dtype. Reading the shape off the source directly, so a
+    lazy provider is not materialised, must not withdraw that.
+    """
+    rng = np.random.RandomState(3)
+    source = rng.randn(120, 1) * 5 + 40
+    calibration = MultiHeadRidgeCalibration(n_heads=1)
+    calibration.fit(source[:, 0] * 1.1 + 2, source)
+
+    column = rng.randn(10) * 5 + 40
+    out = calibration.transform(wrap(column))
+    assert np.shape(out) == (10,)
+    assert np.isfinite(out).all()

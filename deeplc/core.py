@@ -214,6 +214,105 @@ def calibrate(
     return calibration
 
 
+class HeadColumnSource:
+    """
+    A model's predictions for whichever heads are asked for, evaluated on demand.
+
+    Stands in for the ``(n, n_heads)`` matrix wherever a calibration is given its source, and
+    is indexed the same way: ``source[:, heads]`` predicts those heads and nothing else. A
+    multitask model has one head per LC setup, so that matrix is 26 kB per peptide at 6,543
+    setups, and a fitted calibration reads a few dozen columns of it; asking the model for
+    those columns instead costs 320 bytes per peptide and skips the rest of the head layer.
+
+    Passing this or a real matrix makes no difference to the calibration, and none to the
+    caller, which hands over one source either way. ``np.asarray`` on it still yields the
+    whole matrix, so code that genuinely needs every head, such as ranking them during
+    ``fit``, keeps working.
+
+    Parameters
+    ----------
+    psm_list
+        The peptides to predict.
+    model
+        Model or path, as :func:`predict` takes it.
+    predict_kwargs
+        Extra arguments for the prediction, such as the device and batch size.
+    n_heads
+        How many heads the model has, so the shape is known without predicting anything.
+
+    """
+
+    #: Marks this as a source a calibration may index instead of a materialised matrix.
+    is_head_source = True
+
+    def __init__(
+        self, psm_list, model=None, predict_kwargs: dict | None = None, n_heads: int | None = None
+    ):
+        """Initialize the source; nothing is predicted until a column is asked for."""
+        self._psm_list = _parse_psms(psm_list)
+        self._model = model
+        self._predict_kwargs = dict(predict_kwargs or {})
+        loaded = _model_ops.load_model(
+            model or DEFAULT_MODEL, device=self._predict_kwargs.get("device")
+        )
+        self._n_heads = int(n_heads if n_heads is not None else getattr(loaded, "n_tasks", 1))
+        self._cache: tuple[tuple[int, ...], np.ndarray] | None = None
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """Rows and head count, without evaluating anything."""
+        return (len(self._psm_list), self._n_heads)
+
+    @property
+    def ndim(self) -> int:
+        """Always two: this stands in for a matrix."""
+        return 2
+
+    def __getitem__(self, key) -> np.ndarray:
+        """
+        Predict the heads a ``[:, heads]`` slice asks for, and nothing else.
+
+        Only the column part of the key is read; the row part must be everything, because a
+        calibration slices heads and not peptides. This is what lets the calibrations index a
+        source exactly as they index a matrix.
+        """
+        rows, heads = key if isinstance(key, tuple) else (key, None)
+        if heads is None:
+            raise TypeError("a head source is indexed as source[:, heads]")
+        if not (isinstance(rows, slice) and rows == slice(None)):
+            raise TypeError("a head source cannot slice peptides, only heads")
+        wanted = (int(heads),) if np.isscalar(heads) else tuple(int(i) for i in heads)
+        # The same heads are asked for more than once - prediction_report transforms the
+        # queries and then asks the calibration for its head disagreement - and each ask
+        # would otherwise repeat the forward pass.
+        if self._cache is None or self._cache[0] != wanted:
+            self._cache = (
+                wanted,
+                predict(
+                    self._psm_list,
+                    model=self._model,
+                    predict_kwargs={**self._predict_kwargs, "task_idx": list(wanted)},
+                    return_matrix=True,
+                ),
+            )
+        matrix = self._cache[1]
+        return matrix[:, 0] if np.isscalar(heads) else matrix
+
+    def __array__(self, dtype=None, copy=None) -> np.ndarray:
+        """Every head, for the callers that really need the whole matrix."""
+        matrix = predict(
+            self._psm_list,
+            model=self._model,
+            predict_kwargs=self._predict_kwargs,
+            return_matrix=True,
+        )
+        return matrix if dtype is None else matrix.astype(dtype)
+
+    def __len__(self) -> int:
+        """Return the number of peptides."""
+        return len(self._psm_list)
+
+
 def predict_and_calibrate(
     psm_list: PSMList | list[PSM | Peptidoform | str],
     psm_list_reference: PSMList | list[PSM | Peptidoform | str] | None = None,
@@ -261,12 +360,9 @@ def predict_and_calibrate(
 
     # Predict initial retention times
     LOGGER.info("Predicting retention times...")
-    predicted_rt = predict(
-        psm_list=parsed_psm_list,
-        model=model,
-        predict_kwargs=predict_kwargs,
-        return_matrix=True,
-    )
+    # A source rather than a matrix: the calibration pulls the heads it reads, which for a
+    # multitask model is a few dozen of thousands.
+    predicted_rt = HeadColumnSource(parsed_psm_list, model=model, predict_kwargs=predict_kwargs)
 
     if calibration is not None:
         calibration = upgrade_calibration(calibration)

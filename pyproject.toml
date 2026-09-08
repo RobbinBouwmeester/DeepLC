@@ -1,6 +1,6 @@
 [project]
 name = "deeplc"
-version = "4.3.0"
+version = "4.4.0"
 description = "DeepLC: Retention time prediction for (modified) peptides using Deep Learning."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -39,6 +39,7 @@ dependencies = [
     "pandas>=0.25,<3",
     "scikit-learn>=1.2.0,<2",
     "psm-utils>=1.5,<2",
+    "rapidfuzz>=3,<4",
     "click>=8,<9",
     "rich>=13,<15",
 ]

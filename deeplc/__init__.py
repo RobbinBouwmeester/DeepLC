@@ -11,9 +11,12 @@ from deeplc.core import (
     save_model,
     train,
 )
+from deeplc.report import TrainingIndex, prediction_report
 
 __version__: str = version("deeplc")
 __all__: list[str] = [
+    "TrainingIndex",
+    "prediction_report",
     "calibrate",
     "predict",
     "predict_and_calibrate",

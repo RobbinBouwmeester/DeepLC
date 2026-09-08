@@ -28,6 +28,24 @@ from deeplc.exceptions import CalibrationError
 LOGGER = logging.getLogger(__name__)
 
 
+def as_head_matrix(source):
+    """
+    Coerce a source to a two-dimensional float64 matrix, unless it is a head source.
+
+    Anything array-like is converted exactly as before, so a list, a tuple or the
+    one-dimensional output of a single-task model all keep working. An object that marks
+    itself with ``is_head_source``, such as :class:`deeplc.core.HeadColumnSource`, is passed
+    through: it answers ``.shape`` and ``source[:, heads]`` like an array but evaluates only
+    the heads that are asked for, which for a multitask model is a few dozen of thousands.
+    """
+    if getattr(source, "is_head_source", False):
+        return source
+    source = np.asarray(source, dtype=np.float64)
+    if source.ndim == 1:
+        source = source[:, None]
+    return source
+
+
 class MultiHeadCalibration(ABC):
     """Abstract base class for a calibration that selects its own head(s) from a matrix."""
 
@@ -56,6 +74,17 @@ class MultiHeadCalibration(ABC):
     def transform(self, source: np.ndarray) -> np.ndarray:
         """Transform the source matrix into the calibrated target space."""
         ...
+
+    def disagreement(self, source: np.ndarray) -> np.ndarray | None:  # noqa: ARG002
+        """
+        Per-input uncertainty score, or None when the calibration has none.
+
+        A calibration that combines several estimates of the same retention time can report
+        how far they lie apart for each input, which :func:`deeplc.report.prediction_report`
+        uses to scale its prediction intervals per peptide. One fitted on a single head has
+        no spread to report and keeps this default.
+        """
+        return None
 
 
 class _SingleHeadCalibration(MultiHeadCalibration):
@@ -120,9 +149,7 @@ class _SingleHeadCalibration(MultiHeadCalibration):
         """
         if not self.is_fitted:
             raise CalibrationError("The model has not been fitted yet. Call fit() first.")
-        source = np.asarray(source, dtype=np.float64)
-        if source.ndim == 1:
-            source = source[:, None]
+        source = as_head_matrix(source)
         head = self.selected_model_head
         if source.shape[1] <= head:
             raise CalibrationError(
@@ -132,7 +159,10 @@ class _SingleHeadCalibration(MultiHeadCalibration):
         if source.shape[0] == 0:
             return np.array([])
         return np.asarray(
-            self._inner.transform(source[:, head].astype(np.float32)), dtype=np.float64
+            self._inner.transform(
+                np.asarray(source[:, head], dtype=np.float64).astype(np.float32)
+            ),
+            dtype=np.float64,
         )
 
 
@@ -285,9 +315,7 @@ class MultiHeadRidgeCalibration(MultiHeadCalibration):
         """
         if not self.is_fitted:
             raise CalibrationError("The model has not been fitted yet. Call fit() first.")
-        source = np.asarray(source, dtype=np.float64)
-        if source.ndim == 1:
-            source = source[:, None]
+        source = as_head_matrix(source)
         head_idx = cast(np.ndarray, self._head_idx)
         if source.shape[1] <= int(head_idx.max()):
             raise CalibrationError(
@@ -296,13 +324,41 @@ class MultiHeadRidgeCalibration(MultiHeadCalibration):
             )
         if source.shape[0] == 0:
             return np.array([])
-        calibrated = np.column_stack(
+        return np.asarray(self._ridge.predict(self._calibrated_columns(source)), dtype=np.float64)
+
+    def _calibrated_columns(self, source: np.ndarray) -> np.ndarray:
+        """Give each selected head's own estimate of the retention time, in reference units."""
+        head_idx = cast(np.ndarray, self._head_idx)
+        # Asked for in one go rather than head by head: a lazy source then evaluates them in
+        # a single pass, and for an array this is the same slice.
+        columns = np.asarray(source[:, head_idx], dtype=np.float64)
+        return np.column_stack(
             [
-                np.asarray(cal.transform(source[:, head].astype(np.float32)), dtype=np.float64)
-                for cal, head in zip(self._head_calibrations, head_idx, strict=True)
+                np.asarray(cal.transform(columns[:, i].astype(np.float32)), dtype=np.float64)
+                for i, cal in enumerate(self._head_calibrations)
             ]
         )
-        return np.asarray(self._ridge.predict(calibrated), dtype=np.float64)
+
+    def disagreement(self, source: np.ndarray) -> np.ndarray | None:
+        """
+        Report how far the combined setup heads lie apart for each input, in reference units.
+
+        Every selected head estimates the retention time of the same peptide, so the spread of
+        those estimates, weighted by the ridge weight each head received, is an uncertainty
+        that varies from peptide to peptide rather than only along the gradient. Returns None
+        while the calibration is unfitted or combines a single head, which carries no spread.
+        """
+        if not self.is_fitted:
+            return None
+        columns = as_head_matrix(source)
+        if columns.shape[0] == 0 or len(cast(np.ndarray, self._head_idx)) < 2:
+            return None
+        weights = np.abs(np.asarray(self._ridge.coef_, dtype=np.float64).ravel())
+        total = weights.sum()
+        weights = weights / total if total > 0 else np.full(len(weights), 1 / len(weights))
+        estimates = self._calibrated_columns(columns)
+        mean = estimates @ weights
+        return np.sqrt(((estimates - mean[:, None]) ** 2) @ weights)
 
 
 def upgrade_calibration(calibration: Calibration | MultiHeadCalibration) -> MultiHeadCalibration:
