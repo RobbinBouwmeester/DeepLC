@@ -1,4 +1,11 @@
-"""Calibration utilities."""
+"""
+Naive calibration utilities.
+
+Every class here maps a single series of raw predictions onto a single series of observed
+values: ``fit(target: (n,), source: (n,))`` / ``transform(source: (n,)) -> (n,)``. None of them
+know about multitask models or LC-setup heads; see :mod:`deeplc.calibration.multihead` for the
+classes that select a head from a ``(n, n_heads)`` prediction matrix and delegate to one of these.
+"""
 
 from __future__ import annotations
 
@@ -17,9 +24,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class Calibration(ABC):
-    """Abstract base class for calibration."""
-
-    selected_model_head: int | None = None
+    """Abstract base class for a single-series calibration."""
 
     @abstractmethod
     def __init__(self, *args, **kwargs):
@@ -45,6 +50,10 @@ class Calibration(ABC):
 
 class IdentityCalibration(Calibration):
     """No calibration; returns inputs unchanged."""
+
+    def __init__(self) -> None:
+        """Initialize IdentityCalibration."""
+        super().__init__()
 
     @property
     def is_fitted(self) -> bool:

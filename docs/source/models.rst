@@ -22,6 +22,47 @@ The 4.0 default, ``multitask_model.pt`` (shared trunk, one head per setup), stay
 bundled as :data:`deeplc.core.LEGACY_MULTITASK_MODEL` and can be passed as
 ``model=`` to any core function to reproduce 4.0 and 4.1.0 predictions.
 
+Calibrating against several setups at once
+==========================================
+
+:func:`deeplc.calibrate` and :func:`deeplc.predict_and_calibrate` calibrate against the full
+``(n, n_heads)`` prediction matrix of a model (``n_heads=1`` for a single-setup model), and the
+calibration instance is responsible for selecting which head(s) to use.
+:class:`~deeplc.calibration.MultiHeadCalibration` is the base for such calibrations; the default
+is :class:`~deeplc.calibration.MultiHeadRidgeCalibration`: every head is ranked by Pearson
+correlation to the reference, the 80 best are calibrated individually, and a ridge regression maps
+those calibrated estimates onto the observed retention times, so several setups contribute. The
+number of heads is the one parameter worth changing: 80 sits on a flat optimum between roughly 40
+and 320, and the class never fits more weights than half the reference allows. Prediction costs
+nothing extra, because the full head matrix is computed either way.
+
+A lighter alternative, a single naive calibration on the best-correlating head, is available via
+:class:`~deeplc.calibration.MultiHeadSplineCalibration` or
+:class:`~deeplc.calibration.MultiHeadPiecewiseLinearCalibration`:
+
+.. code-block:: python
+
+   from deeplc import predict_and_calibrate
+   from deeplc.calibration import MultiHeadSplineCalibration
+
+   calibrated_rt = predict_and_calibrate(
+       psm_list,
+       psm_list_reference=reference,
+       calibration=MultiHeadSplineCalibration(),
+   )
+
+The naive, single-series calibrations in :mod:`deeplc.calibration.simple`
+(:class:`~deeplc.calibration.SplineTransformerCalibration`,
+:class:`~deeplc.calibration.PiecewiseLinearCalibration`,
+:class:`~deeplc.calibration.IdentityCalibration`) know nothing about heads; the ``MultiHead*``
+classes above delegate to them once a head is picked. An unfitted
+:class:`~deeplc.calibration.SplineTransformerCalibration` or
+:class:`~deeplc.calibration.PiecewiseLinearCalibration` passed to ``calibrate`` or
+``predict_and_calibrate`` is upgraded to its ``MultiHead*`` counterpart automatically via
+:func:`deeplc.calibration.upgrade_calibration`. An already fitted naive calibration is not
+accepted, since it carries no record of which head it was fit on; fit a ``MultiHead*Calibration``
+instead in that case.
+
 Training a model from scratch
 ==============================
 

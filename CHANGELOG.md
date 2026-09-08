@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.0] - 2026-09-02
+
+### Added
+
+- `deeplc.calibration` is now a package. `deeplc.calibration.simple` holds the naive,
+  single-series calibrations unchanged (`Calibration` ABC, `IdentityCalibration`,
+  `PiecewiseLinearCalibration`, `SplineTransformerCalibration`). New
+  `deeplc.calibration.multihead` holds `MultiHeadCalibration`, the ABC for a calibration that
+  takes the whole `(n, n_heads)` prediction matrix `predict(..., return_matrix=True)` returns and
+  selects its own head(s): `MultiHeadPiecewiseLinearCalibration` and `MultiHeadSplineCalibration`
+  rank heads by Pearson correlation and delegate to the matching naive class on the winner, and
+  `MultiHeadRidgeCalibration` combines several best-correlating heads with a ridge fit. All three
+  are re-exported from `deeplc.calibration`, unchanged import path for existing names.
+
+  On the eight PRIDE setups that no DeepLC model was trained on, `MultiHeadRidgeCalibration`
+  lowered the held-out error on all eight, by a median of 13 % relative to the observed gradient.
+
+- `deeplc.calibration.upgrade_calibration`, wrapping an unfitted naive `Calibration` in its
+  `MultiHead*Calibration` counterpart. `calibrate()` and `predict_and_calibrate()` call it on
+  whatever `calibration` they are given, so passing a naive instance (e.g.
+  `SplineTransformerCalibration()`) still works, calibrated on the best-correlating head instead
+  of head 0. A fitted naive instance is rejected: it carries no record of which head it was fit
+  on, so fit a `MultiHead*Calibration` instead in that case.
+
+### Changed
+
+- `calibrate()` and `predict_and_calibrate()` default to `MultiHeadRidgeCalibration()` for every
+  model, single-task included (it reduces to a spline plus a linear rescaling on one column). Pass
+  `MultiHeadSplineCalibration()` or `MultiHeadPiecewiseLinearCalibration()` for a lighter
+  calibration. `Calibration.selected_model_head`/`uses_all_heads` are gone: head selection now
+  lives entirely in the `MultiHeadCalibration` implementations.
+
+  **Breaking**: an already-fitted naive `Calibration` passed directly to
+  `predict_and_calibrate()` is now rejected; fit a `MultiHead*Calibration` instead.
+
+### Fixed
+
+- `IdentityCalibration()` could not be instantiated: it never overrode the abstract
+  `Calibration.__init__`.
+
 ## [4.2.0] - 2026-08-28
 
 ### Changed

@@ -9,7 +9,7 @@ from psm_utils import PSM, PSMList
 
 from deeplc import core
 from deeplc._reference_selection import deduplicate_psms
-from deeplc.calibration import SplineTransformerCalibration
+from deeplc.calibration import MultiHeadSplineCalibration
 
 _PEPTIDES = [
     "AAGPSLSHTSGGTQSK",
@@ -164,7 +164,7 @@ def test_calibrate_always_uses_the_first_observations():
 
     calibration = core.calibrate(reference, predict_kwargs={"device": "cpu"})
     predicted = core.predict(targets, return_matrix=True)
-    calibrated = calibration.transform(predicted[:, calibration.selected_model_head or 0])
+    calibrated = calibration.transform(predicted)
 
     assert np.isfinite(calibrated).all()
     clean_low, clean_high = 5.0, 5.0 + 3.0 * (len(_PEPTIDES) - 1)
@@ -177,16 +177,15 @@ def test_a_prefitted_calibration_is_the_way_to_keep_the_repeats():
     The escape hatch for the rare caller who wants every reference PSM to count.
 
     ``calibrate`` deduplicates unconditionally, so a caller who wants the repeats weighed fits
-    a ``Calibration`` on its own targets and passes it in; ``predict_and_calibrate`` then uses
-    it as given instead of fitting one.
+    a ``MultiHeadCalibration`` on its own targets and passes it in; ``predict_and_calibrate`` then
+    uses it as given instead of fitting one.
     """
     reference = _reference_with_duplicates()
     psm_list = _psms([(s, None) for s in _PEPTIDES])
 
     source = core.predict(reference, predict_kwargs={"device": "cpu"}, return_matrix=True)
-    own = SplineTransformerCalibration()
-    own.selected_model_head = 0
-    own.fit(target=np.array(reference["retention_time"], dtype=np.float32), source=source[:, 0])
+    own = MultiHeadSplineCalibration()
+    own.fit(target=np.array(reference["retention_time"], dtype=np.float32), source=source)
 
     kept = core.predict_and_calibrate(
         psm_list, psm_list_reference=reference, calibration=own, predict_kwargs={"device": "cpu"}
