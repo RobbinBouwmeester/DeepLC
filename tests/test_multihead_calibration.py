@@ -380,3 +380,65 @@ def test_core_rejects_a_fitted_naive_calibration():
             calibration=naive,
             predict_kwargs={"device": "cpu"},
         )
+
+
+class _CountingSource:
+    """A column source that records which heads were asked for."""
+
+    def __init__(self, matrix: np.ndarray):
+        self._matrix = matrix
+        self.requests: list[tuple[int, ...]] = []
+
+    @property
+    def shape(self):
+        return self._matrix.shape
+
+    @property
+    def ndim(self):
+        return 2
+
+    def columns(self, indices) -> np.ndarray:
+        wanted = tuple(int(i) for i in indices)
+        self.requests.append(wanted)
+        return self._matrix[:, list(wanted)]
+
+    def __array__(self, dtype=None, copy=None):
+        raise AssertionError("the whole matrix should not be materialised")
+
+
+def test_column_source_matches_a_matrix():
+    """
+    A calibration must not care whether its source is a matrix or a column provider.
+
+    That equivalence is what lets the caller hand over one source and never branch on the
+    calibration, while a multitask model evaluates only the heads that get read.
+    """
+    rng = np.random.RandomState(0)
+    source = rng.randn(200, 300) * 5 + 40
+    target = source[:, 11] * 1.1 + 2 + rng.randn(200) * 0.1
+    query = rng.randn(40, 300) * 5 + 40
+
+    for calibration in (MultiHeadRidgeCalibration(n_heads=12), SplineTransformerCalibration()):
+        fitted = upgrade_calibration(calibration)
+        fitted.fit(target, source)
+        lazy = _CountingSource(query)
+        np.testing.assert_allclose(fitted.transform(lazy), fitted.transform(query), atol=1e-8)
+        # every read is one request for all the heads that calibration uses
+        assert len(lazy.requests) == 1
+        assert len(lazy.requests[0]) == len(getattr(fitted, "_head_idx", [0]))
+
+
+def test_column_source_serves_the_disagreement_too():
+    """The per-peptide spread reads the same columns, so it works off a lazy source as well."""
+    rng = np.random.RandomState(1)
+    source = rng.randn(200, 120) * 5 + 40
+    target = source[:, 3] * 0.9 + 1 + rng.randn(200) * 0.2
+    query = rng.randn(30, 120) * 5 + 40
+
+    calibration = MultiHeadRidgeCalibration(n_heads=10)
+    calibration.fit(target, source)
+    np.testing.assert_allclose(
+        calibration.disagreement(_CountingSource(query)),
+        calibration.disagreement(query),
+        atol=1e-8,
+    )

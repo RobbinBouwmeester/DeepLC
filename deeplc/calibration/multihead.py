@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import cast
 
 import numpy as np
@@ -26,6 +27,33 @@ from deeplc.calibration.simple import (
 from deeplc.exceptions import CalibrationError
 
 LOGGER = logging.getLogger(__name__)
+
+
+def take_columns(source, indices: Sequence[int]) -> np.ndarray:
+    """
+    Take the named head columns from a source, as float64 of shape ``(n, len(indices))``.
+
+    The source is normally the ``(n, n_heads)`` matrix a model returned. It may instead be an
+    object offering ``columns(indices)``, such as :class:`deeplc.core.HeadColumnSource`, which
+    evaluates only the heads asked for: a calibration reads a few dozen of the thousands a
+    multitask model has, and at 6,543 setups the unread columns are 26 kB per peptide. Which
+    of the two it is makes no difference to a calibration, and the caller hands over the same
+    thing either way.
+    """
+    if hasattr(source, "columns"):
+        taken = source.columns(indices)
+    else:
+        matrix = np.asarray(source)
+        if matrix.ndim == 1:
+            matrix = matrix[:, None]
+        taken = matrix[:, list(indices)]
+    return np.asarray(taken, dtype=np.float64)
+
+
+def source_shape(source) -> tuple[int, int]:
+    """Rows and head count of a source, without materialising a lazy one."""
+    shape = tuple(source.shape)
+    return (shape[0], shape[1] if len(shape) > 1 else 1)
 
 
 class MultiHeadCalibration(ABC):
@@ -131,20 +159,17 @@ class _SingleHeadCalibration(MultiHeadCalibration):
         """
         if not self.is_fitted:
             raise CalibrationError("The model has not been fitted yet. Call fit() first.")
-        source = np.asarray(source, dtype=np.float64)
-        if source.ndim == 1:
-            source = source[:, None]
         head = self.selected_model_head
-        if source.shape[1] <= head:
+        rows, n_heads = source_shape(source)
+        if n_heads <= head:
             raise CalibrationError(
-                f"source has {source.shape[1]} heads, but the calibration was fitted on a model "
+                f"source has {n_heads} heads, but the calibration was fitted on a model "
                 f"with at least {head + 1}."
             )
-        if source.shape[0] == 0:
+        if rows == 0:
             return np.array([])
-        return np.asarray(
-            self._inner.transform(source[:, head].astype(np.float32)), dtype=np.float64
-        )
+        column = take_columns(source, [head])[:, 0]
+        return np.asarray(self._inner.transform(column.astype(np.float32)), dtype=np.float64)
 
 
 class MultiHeadPiecewiseLinearCalibration(_SingleHeadCalibration):
@@ -296,26 +321,29 @@ class MultiHeadRidgeCalibration(MultiHeadCalibration):
         """
         if not self.is_fitted:
             raise CalibrationError("The model has not been fitted yet. Call fit() first.")
-        source = np.asarray(source, dtype=np.float64)
-        if source.ndim == 1:
-            source = source[:, None]
         head_idx = cast(np.ndarray, self._head_idx)
-        if source.shape[1] <= int(head_idx.max()):
+        rows, n_heads = source_shape(source)
+        if n_heads <= int(head_idx.max()):
             raise CalibrationError(
-                f"source has {source.shape[1]} heads, but the calibration was fitted on a model "
+                f"source has {n_heads} heads, but the calibration was fitted on a model "
                 f"with at least {int(head_idx.max()) + 1}."
             )
-        if source.shape[0] == 0:
+        if rows == 0:
             return np.array([])
         return np.asarray(self._ridge.predict(self._calibrated_columns(source)), dtype=np.float64)
 
-    def _calibrated_columns(self, source: np.ndarray) -> np.ndarray:
+    def _calibrated_columns(self, source) -> np.ndarray:
         """Give each selected head's own estimate of the retention time, in reference units."""
         head_idx = cast(np.ndarray, self._head_idx)
+        # One request for every selected head, so a lazy source evaluates them in a single
+        # pass rather than once per head.
+        columns = take_columns(source, head_idx)
         return np.column_stack(
             [
-                np.asarray(cal.transform(source[:, head].astype(np.float32)), dtype=np.float64)
-                for cal, head in zip(self._head_calibrations, head_idx, strict=True)
+                np.asarray(
+                    cal.transform(columns[:, position].astype(np.float32)), dtype=np.float64
+                )
+                for position, cal in enumerate(self._head_calibrations)
             ]
         )
 
@@ -330,15 +358,13 @@ class MultiHeadRidgeCalibration(MultiHeadCalibration):
         """
         if not self.is_fitted:
             return None
-        columns = np.asarray(source, dtype=np.float64)
-        if columns.ndim == 1:
-            columns = columns[:, None]
-        if columns.shape[0] == 0 or len(cast(np.ndarray, self._head_idx)) < 2:
+        rows, _ = source_shape(source)
+        if rows == 0 or len(cast(np.ndarray, self._head_idx)) < 2:
             return None
         weights = np.abs(np.asarray(self._ridge.coef_, dtype=np.float64).ravel())
         total = weights.sum()
         weights = weights / total if total > 0 else np.full(len(weights), 1 / len(weights))
-        estimates = self._calibrated_columns(columns)
+        estimates = self._calibrated_columns(source)
         mean = estimates @ weights
         return np.sqrt(((estimates - mean[:, None]) ** 2) @ weights)
 
