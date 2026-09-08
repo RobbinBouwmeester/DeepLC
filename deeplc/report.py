@@ -37,7 +37,12 @@ from psm_utils import PSM, Peptidoform, PSMList
 
 from deeplc import core
 from deeplc._reference_selection import deduplicate_psms, select_reference_psms
-from deeplc.calibration import Calibration, SplineTransformerCalibration
+from deeplc.calibration import (
+    Calibration,
+    MultiHeadCalibration,
+    SplineTransformerCalibration,
+    upgrade_calibration,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -324,7 +329,7 @@ class _ConformalInterval:
 def _crossfit_residuals(
     y_reference: np.ndarray,
     matrix_reference: np.ndarray,
-    calibration_template: Calibration,
+    calibration_template: Calibration | MultiHeadCalibration,
     seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """
@@ -344,21 +349,11 @@ def _crossfit_residuals(
     difficulty: np.ndarray | None = np.empty(len(y_reference))
     for i, fold in enumerate(folds):
         train = np.concatenate([f for j, f in enumerate(folds) if j != i])
-        calibration = copy.deepcopy(calibration_template)
-        if getattr(calibration, "uses_all_heads", False):
-            calibration.fit(target=y_reference[train], source=matrix_reference[train])
-            predicted[fold] = calibration.transform(matrix_reference[fold])
-        else:
-            head = core._best_correlating_head(matrix_reference[train], y_reference[train])
-            calibration.selected_model_head = head
-            calibration.fit(
-                target=y_reference[train].astype(np.float32),
-                source=matrix_reference[train][:, head].astype(np.float32),
-            )
-            predicted[fold] = np.asarray(
-                calibration.transform(matrix_reference[fold][:, head].astype(np.float32)),
-                dtype=float,
-            )
+        # Every calibration takes the whole head matrix and picks its own heads from it, so
+        # there is one path here regardless of how many heads it ends up using.
+        calibration = upgrade_calibration(copy.deepcopy(calibration_template))
+        calibration.fit(target=y_reference[train], source=matrix_reference[train])
+        predicted[fold] = np.asarray(calibration.transform(matrix_reference[fold]), dtype=float)
         fold_difficulty = calibration.disagreement(matrix_reference[fold])
         if difficulty is None or fold_difficulty is None:
             difficulty = None
@@ -371,7 +366,7 @@ def prediction_report(
     psm_list: PSMList | list[PSM | Peptidoform | str],
     psm_list_reference: PSMList | list[PSM | Peptidoform | str] | None = None,
     model: torch.nn.Module | PathLike | str | None = None,
-    calibration: Calibration | None = None,
+    calibration: Calibration | MultiHeadCalibration | None = None,
     coverage: float = 0.90,
     training_index: TrainingIndex | PathLike | str | None = None,
     per_peptide_width: bool = True,
@@ -447,21 +442,14 @@ def prediction_report(
     import copy
 
     template = copy.deepcopy(calibration)
-    if getattr(calibration, "uses_all_heads", False):
-        calibration.fit(target=y_reference, source=matrix_reference)
-        predicted = calibration.transform(matrix_query)
-        selected_heads = np.asarray(calibration._head_idx, dtype=int)
-    else:
-        head = core._best_correlating_head(matrix_reference, y_reference)
-        calibration.selected_model_head = head
-        calibration.fit(
-            target=y_reference.astype(np.float32),
-            source=matrix_reference[:, head].astype(np.float32),
-        )
-        predicted = np.asarray(
-            calibration.transform(matrix_query[:, head].astype(np.float32)), dtype=float
-        )
-        selected_heads = np.array([head], dtype=int)
+    calibration = upgrade_calibration(calibration)
+    calibration.fit(target=y_reference, source=matrix_reference)
+    predicted = np.asarray(calibration.transform(matrix_query), dtype=float)
+    # Which setups the calibration leaned on, for the membership columns below. A calibration
+    # that fits one head reports that head; one that combines several reports all of them.
+    selected_heads = np.asarray(
+        getattr(calibration, "_head_idx", [calibration.selected_model_head]), dtype=int
+    )
 
     cross_predicted, residuals, cross_difficulty = _crossfit_residuals(
         y_reference, matrix_reference, template
