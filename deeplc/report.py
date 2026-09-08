@@ -434,9 +434,10 @@ def prediction_report(
     matrix_reference = core.predict(
         reference, model=model, predict_kwargs=predict_kwargs, return_matrix=True
     ).astype(np.float64)
-    matrix_query = core.predict(
-        parsed, model=model, predict_kwargs=predict_kwargs, return_matrix=True
-    ).astype(np.float64)
+    # The queries are handed over as a source rather than a matrix: the calibration asks it
+    # for the heads it reads, which for a fitted MultiHeadRidgeCalibration is eighty of 6,543.
+    # Materialising all of them costs 26 kB per peptide and none of it is read.
+    matrix_query = core.HeadColumnSource(parsed, model=model, predict_kwargs=predict_kwargs)
     y_reference = np.array(reference["retention_time"], dtype=np.float64)
 
     import copy
