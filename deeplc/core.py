@@ -218,7 +218,8 @@ class HeadColumnSource:
     """
     A model's predictions for whichever heads are asked for, evaluated on demand.
 
-    Stands in for the ``(n, n_heads)`` matrix wherever a calibration is given its source. A
+    Stands in for the ``(n, n_heads)`` matrix wherever a calibration is given its source, and
+    is indexed the same way: ``source[:, heads]`` predicts those heads and nothing else. A
     multitask model has one head per LC setup, so that matrix is 26 kB per peptide at 6,543
     setups, and a fitted calibration reads a few dozen columns of it; asking the model for
     those columns instead costs 320 bytes per peptide and skips the rest of the head layer.
@@ -240,6 +241,9 @@ class HeadColumnSource:
         How many heads the model has, so the shape is known without predicting anything.
 
     """
+
+    #: Marks this as a source a calibration may index instead of a materialised matrix.
+    is_head_source = True
 
     def __init__(
         self, psm_list, model=None, predict_kwargs: dict | None = None, n_heads: int | None = None
@@ -264,11 +268,22 @@ class HeadColumnSource:
         """Always two: this stands in for a matrix."""
         return 2
 
-    def head_columns(self, indices) -> np.ndarray:
-        """Predictions for the given heads, shape ``(n, len(indices))``, in that order."""
-        wanted = tuple(int(i) for i in indices)
-        # Callers ask for the same heads more than once - prediction_report transforms the
-        # queries and then asks the same calibration for its head disagreement - and each ask
+    def __getitem__(self, key) -> np.ndarray:
+        """
+        Predict the heads a ``[:, heads]`` slice asks for, and nothing else.
+
+        Only the column part of the key is read; the row part must be everything, because a
+        calibration slices heads and not peptides. This is what lets the calibrations index a
+        source exactly as they index a matrix.
+        """
+        rows, heads = key if isinstance(key, tuple) else (key, None)
+        if heads is None:
+            raise TypeError("a head source is indexed as source[:, heads]")
+        if not (isinstance(rows, slice) and rows == slice(None)):
+            raise TypeError("a head source cannot slice peptides, only heads")
+        wanted = (int(heads),) if np.isscalar(heads) else tuple(int(i) for i in heads)
+        # The same heads are asked for more than once - prediction_report transforms the
+        # queries and then asks the calibration for its head disagreement - and each ask
         # would otherwise repeat the forward pass.
         if self._cache is None or self._cache[0] != wanted:
             self._cache = (
@@ -280,7 +295,8 @@ class HeadColumnSource:
                     return_matrix=True,
                 ),
             )
-        return self._cache[1]
+        matrix = self._cache[1]
+        return matrix[:, 0] if np.isscalar(heads) else matrix
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
         """Every head, for the callers that really need the whole matrix."""

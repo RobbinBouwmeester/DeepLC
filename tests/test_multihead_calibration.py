@@ -384,7 +384,9 @@ def test_core_rejects_a_fitted_naive_calibration():
 
 
 class _CountingSource:
-    """A column source that records which heads were asked for."""
+    """A head source that records which heads were asked for, and refuses to be materialised."""
+
+    is_head_source = True
 
     def __init__(self, matrix: np.ndarray):
         self._matrix = matrix
@@ -398,10 +400,13 @@ class _CountingSource:
     def ndim(self):
         return 2
 
-    def head_columns(self, indices) -> np.ndarray:
-        wanted = tuple(int(i) for i in indices)
+    def __getitem__(self, key) -> np.ndarray:
+        rows, heads = key
+        assert isinstance(rows, slice) and rows == slice(None)
+        wanted = (int(heads),) if np.isscalar(heads) else tuple(int(i) for i in heads)
         self.requests.append(wanted)
-        return self._matrix[:, list(wanted)]
+        taken = self._matrix[:, list(wanted)]
+        return taken[:, 0] if np.isscalar(heads) else taken
 
     def __array__(self, dtype=None, copy=None):
         raise AssertionError("the whole matrix should not be materialised")
