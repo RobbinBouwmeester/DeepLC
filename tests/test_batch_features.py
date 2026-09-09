@@ -207,3 +207,41 @@ def test_a_label_beyond_the_window_warns_instead_of_raising():
         )
     assert np.isfinite(reference["matrix"]).all()
     assert_agrees([sequence], padding_length=20)
+
+
+def test_a_ccs_dataset_keeps_the_per_peptide_path():
+    """
+    The collision cross section layout must never reach the batched route.
+
+    IM2Deep holds a CCS model trained against the pre-4.0.1 encoding and reaches DeepLC
+    only through ``DeepLCDataset.from_psm_list(psm_list, add_ccs_features=True)``, so this
+    is the call that has to keep the per-peptide encoder. Two things decline it - the CCS
+    extras and the rolling sum, which ``from_psm_list`` leaves on - and this asserts the
+    outcome rather than either reason, so removing one of them still fails here.
+    """
+    from psm_utils import PSM, PSMList
+
+    import deeplc.data as data_module
+
+    peptidoforms = ["AC[UNIMOD:4]DEK/2", "[UNIMOD:737]-PEPTIDEK/2", "PEPTM[UNIMOD:35]IDEKR/3"]
+    psm_list = PSMList(
+        psm_list=[
+            PSM(peptidoform=Peptidoform(p), spectrum_id=str(i), retention_time=float(i))
+            for i, p in enumerate(peptidoforms)
+        ]
+    )
+    dataset = DeepLCDataset.from_psm_list(psm_list, add_ccs_features=True)
+    assert dataset.vectorised_encoding, "the switch is on; the layout is what declines it"
+
+    calls = []
+    original = data_module.encode_batch_features
+    data_module.encode_batch_features = lambda *args, **kwargs: calls.append(1)
+    try:
+        batch = dataset.encode_batch(range(len(peptidoforms)))
+    finally:
+        data_module.encode_batch_features = original
+
+    assert not calls, "a CCS dataset must not enter the batched encoder"
+    for position in range(4):
+        stacked = torch.stack([dataset[i][0][position] for i in range(len(peptidoforms))])
+        assert torch.equal(batch[position], stacked), position
