@@ -349,6 +349,12 @@ def _apply_composition_to_matrices(
             except KeyError:
                 warnings.warn(f"Ignoring atom {atom_comp} at pos {i}", stacklevel=2)
                 continue
+            except IndexError:
+                # Same guard as the branch below, which this one was missing: a modification
+                # placed beyond the padding window has no row to add itself to. Reachable
+                # with an isotope-labelled modification, so a TMT or SILAC label, on a
+                # peptide longer than the window, where it raised instead of warning.
+                warnings.warn(f"Index error for atom {atom_comp} at pos {i}", stacklevel=2)
         except IndexError:
             warnings.warn(f"Index error for atom {atom_comp} at pos {i}", stacklevel=2)
 
