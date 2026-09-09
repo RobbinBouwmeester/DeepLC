@@ -3,10 +3,11 @@
 import copy
 import inspect
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from os import PathLike
 from pathlib import Path
 
+import numpy as np
 import torch
 from rich.progress import (
     BarColumn,
@@ -250,8 +251,16 @@ def predict(
     num_threads: int | None = None,
     show_progress: bool = True,
     task_idx: Sequence[int] | None = None,
+    length_buckets: bool = True,
 ) -> torch.Tensor:
-    """Predict using the model for the given dataset."""
+    """
+    Predict using the model for the given dataset.
+
+    ``length_buckets`` runs length-sorted chunks in a window that fits them rather than
+    padding every peptide to the model's full window; see :func:`_length_buckets`. It is
+    exact for models that report a ``padding_reach`` and ignored for those that do not.
+    Set it to False to force one pass over the data in the dataset's own window.
+    """
     # ``task_idx`` selects which LC setups a multitask model evaluates. Without
     # it a model trained on thousands of setups returns a column per setup: at
     # 6,543 setups and a million peptides that output alone is tens of gigabytes,
@@ -260,11 +269,111 @@ def predict(
     torch.set_num_threads(num_threads or torch.get_num_threads())
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(model, device)
-    data_loader = DataLoader(data, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    predictions = _predict_epoch(
-        model, data_loader, device, show_progress=show_progress, task_idx=task_idx
+
+    buckets = _length_buckets(model, data, batch_size) if length_buckets else None
+    if buckets is None:
+        predictions = _predict_epoch(
+            model,
+            data,
+            device,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            show_progress=show_progress,
+            task_idx=task_idx,
+        )
+        return predictions.cpu().detach()
+
+    out: torch.Tensor | None = None
+    for indices, subset in buckets:
+        part = _predict_epoch(
+            model,
+            subset,
+            device,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            show_progress=show_progress,
+            task_idx=task_idx,
+        ).cpu()
+        if out is None:
+            out = torch.empty((len(data), part.shape[1]), dtype=part.dtype)
+        out[indices] = part
+    if out is None:
+        raise ValueError("Dataset is empty — nothing to predict.")
+    return out.detach()
+
+
+#: Widest spread of peptide lengths allowed inside one prediction chunk. Small enough that
+#: no peptide carries much padding, large enough that the dense middle of a length
+#: distribution still fills a batch.
+#: A tight window is worth more than a full batch: enforcing a minimum chunk size, so that the
+#: sparse long tail rides along in a wider window, was measured slower (1,546 against 1,503
+#: peptidoforms/s at a floor of 512 and 1,449 at 2,048).
+_LENGTH_BAND = 4
+
+
+def _residue_count(peptidoform: object) -> int:
+    """
+    Residues in a peptidoform, whether it arrives parsed or as a ProForma string.
+
+    A dataset may hold either. The string form cannot be counted by its length, since
+    modifications and the charge state are part of it, so it is parsed once here rather
+    than per encoded item.
+    """
+    sequence = getattr(peptidoform, "sequence", None)
+    if sequence is None:
+        from psm_utils import Peptidoform
+
+        sequence = Peptidoform(str(peptidoform)).sequence
+    return len(sequence)
+
+
+def _length_buckets(
+    model: torch.nn.Module, data: Dataset, batch_size: int
+) -> list[tuple[torch.Tensor, Dataset]] | None:
+    """
+    Split the dataset into length-sorted chunks, each encoded in a window that fits it.
+
+    Padding every peptide to the model's full window makes the convolutions work on
+    padding: at a 60-position window and a median peptide of 16 residues most of the
+    trunk's arithmetic is spent on positions that are masked out again before pooling.
+    Sorting by length and giving each chunk a window of its own longest peptide plus the
+    trunk's reach is exact - it was measured identical to the full window over 50,000
+    peptides - and about three times faster on CPU.
+
+    Returns None when the model does not report a reach, when the data is not a
+    DeepLCDataset, or when there is nothing to gain, so the caller falls back to one pass.
+    """
+    reach = getattr(model, "padding_reach", None)
+    if reach is None or not isinstance(data, DeepLCDataset) or len(data) == 0:
+        return None
+
+    lengths = np.fromiter(
+        (_residue_count(p) for p in data.peptidoforms), dtype=np.int64, count=len(data)
     )
-    return predictions.cpu().detach()
+    window = data.padding_length
+    order = np.argsort(lengths, kind="stable")
+    sorted_lengths = lengths[order]
+
+    # A chunk is cut either at the batch size or as soon as its longest peptide would exceed
+    # the shortest by more than _LENGTH_BAND, so no peptide is padded much beyond its own
+    # length. Fixed-size chunks are not enough: the longest chunk of a length-sorted set holds
+    # thousands of ordinary peptides alongside the few long ones and inherits their window,
+    # which on a 20,000-peptide set cost 43 % of the throughput.
+    buckets: list[tuple[torch.Tensor, Dataset]] = []
+    start = 0
+    while start < len(order):
+        stop = min(start + batch_size, len(order))
+        band = sorted_lengths[start] + _LENGTH_BAND
+        within = int(np.searchsorted(sorted_lengths[start:stop], band, side="right"))
+        stop = start + max(within, 1)
+        padding = int(min(window, sorted_lengths[stop - 1] + reach))
+        chunk = order[start:stop]
+        buckets.append((torch.as_tensor(chunk), data.variant(chunk.tolist(), padding)))
+        start = stop
+
+    if len(buckets) == 1 and buckets[0][1].padding_length >= window:
+        return None  # one chunk at the full window is what the plain path already does
+    return buckets
 
 
 def supports_task_subset(model: torch.nn.Module) -> bool:
@@ -340,10 +449,30 @@ def _validate_epoch(
     return float(val_loss / len(data_loader))
 
 
+def _feature_batches(data: Dataset, batch_size: int, num_workers: int) -> Iterator[list]:
+    """
+    Yield feature batches, assembled by the dataset itself where it can be.
+
+    A DeepLCDataset encodes a whole batch into one buffer per feature, which skips the
+    per-peptide tensors and the collate step a DataLoader needs. Worker processes and other
+    dataset types keep the DataLoader.
+    """
+    if isinstance(data, DeepLCDataset) and num_workers == 0:
+        for start in range(0, len(data), batch_size):
+            stop = min(start + batch_size, len(data))
+            yield list(data.encode_batch(range(start, stop)))
+    else:
+        loader = DataLoader(data, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        for features, _ in loader:
+            yield list(features)
+
+
 def _predict_epoch(
     model: torch.nn.Module,
-    data_loader: DataLoader,
+    data: Dataset,
     device: str,
+    batch_size: int = 512,
+    num_workers: int = 0,
     show_progress: bool = False,
     task_idx: Sequence[int] | None = None,
 ) -> torch.Tensor:
@@ -353,9 +482,14 @@ def _predict_epoch(
     if task_idx is not None and supports_task_subset(model):
         selected = torch.as_tensor(list(task_idx), dtype=torch.long, device=device)
     predictions = []
+    total = int(np.ceil(len(data) / batch_size)) if hasattr(data, "__len__") else None
     with torch.no_grad():
-        for features, _ in track(
-            data_loader, description="Predicting...", transient=True, disable=not show_progress
+        for features in track(
+            _feature_batches(data, batch_size, num_workers),
+            description="Predicting...",
+            transient=True,
+            disable=not show_progress,
+            total=total,
         ):
             features = [feature_tensor.to(device) for feature_tensor in features]
             outputs = model(*features) if selected is None else model(*features, task_idx=selected)

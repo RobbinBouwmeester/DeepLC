@@ -40,6 +40,7 @@ def encode_peptidoform(
     dict_index_pos: dict[str, int] | None = None,
     dict_index: dict[str, int] | None = None,
     legacy_positional_deltas: bool = False,
+    include_rolling_sum: bool = True,
 ) -> dict[str, np.ndarray]:
     """
     Extract features from a single peptidoform.
@@ -58,6 +59,10 @@ def encode_peptidoform(
         modification on the same residue are indistinguishable.
     padding_length
         The maximum length of the sequence after padding. Default is 60.
+    include_rolling_sum
+        Whether to build ``matrix_sum``, the rolling sum over pairs of positions. Models
+        with a convolutional trunk ignore it; False returns an empty array in its place.
+        Default is True.
     legacy_positional_deltas
         Whether to place modification deltas in the positional block the way versions
         before 4.0.1 did, which was to index ``pos_mat`` without the sorted-layout
@@ -139,7 +144,14 @@ def encode_peptidoform(
         matrix_all = np.append(matrix_all, (seq.count("K") + seq.count("R")) / seq_len)
         matrix_all = np.append(matrix_all, charge)
 
-    matrix_sum = _compute_rolling_sum(std_matrix.T, n=2)[:, ::2].T
+    # The fused trunk reads the per-position matrix directly and deletes this one on the
+    # first line of its forward, so building it is pure cost for those models: the cumulative
+    # sum and its slicing are about a tenth of the encoding work.
+    matrix_sum = (
+        _compute_rolling_sum(std_matrix.T, n=2)[:, ::2].T
+        if include_rolling_sum
+        else np.zeros((0, len(dict_index)), dtype=np.float16)
+    )
 
     matrix_global = np.concatenate([matrix_all, pos_matrix.flatten()])
     if add_terminal_composition:
