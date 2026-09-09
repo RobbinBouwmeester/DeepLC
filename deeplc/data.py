@@ -11,6 +11,7 @@ import torch
 from psm_utils import Peptidoform, PSMList
 from torch.utils.data import Dataset, Subset
 
+from deeplc._batch_features import encode_batch_features, supports
 from deeplc._features import encode_peptidoform
 
 _DatasetT = TypeVar("_DatasetT", bound=Dataset)
@@ -30,6 +31,7 @@ class DeepLCDataset(Dataset):
         padding_length: int = 60,
         legacy_positional_deltas: bool = True,
         include_rolling_sum: bool = True,
+        vectorised_encoding: bool = True,
     ):
         """
         Initialize the DeepLCDataset.
@@ -73,6 +75,11 @@ class DeepLCDataset(Dataset):
             Whether to build the rolling-sum matrix. A convolutional trunk reads the
             per-position matrix directly and ignores this one, so building it is pure cost
             for such a model; False puts an empty array in its place. Default is True.
+        vectorised_encoding
+            Whether :meth:`encode_batch` may gather the residue-only part of a batch in one
+            pass instead of encoding peptide by peptide. It produces the same values, dtype
+            included, and falls back per peptide for anything it does not cover; False forces
+            the per-peptide encoder for everything. Default is True.
 
         Raises
         ------
@@ -88,6 +95,7 @@ class DeepLCDataset(Dataset):
         self.padding_length = padding_length
         self.legacy_positional_deltas = legacy_positional_deltas
         self.include_rolling_sum = include_rolling_sum
+        self.vectorised_encoding = vectorised_encoding
         if self.target_retention_times is not None and len(self.target_retention_times) != len(
             self.peptidoforms
         ):
@@ -126,6 +134,7 @@ class DeepLCDataset(Dataset):
             padding_length=padding_length,
             legacy_positional_deltas=self.legacy_positional_deltas,
             include_rolling_sum=self.include_rolling_sum,
+            vectorised_encoding=self.vectorised_encoding,
         )
 
     #: Arrays the encoder returns, in the order the models take them.
@@ -160,6 +169,25 @@ class DeepLCDataset(Dataset):
         indices = list(indices)
         if not indices:
             raise ValueError("No indices to encode.")
+
+        if self.vectorised_encoding and supports(self.add_ccs_features, self.include_rolling_sum):
+            # The residue-only part of the batch is a table gather; modifications and
+            # anything the gather does not cover go through the per-peptide encoder, so the
+            # values are the same either way. See deeplc._batch_features.
+            features = encode_batch_features(
+                [self.peptidoforms[index] for index in indices],
+                padding_length=self.padding_length,
+                add_terminal_composition=self.add_terminal_composition,
+                legacy_positional_deltas=self.legacy_positional_deltas,
+            )
+            empty = np.zeros((len(indices), 0, features["matrix"].shape[-1]), dtype=np.float32)
+            return (
+                torch.from_numpy(features["matrix"].astype(np.float32)),
+                torch.from_numpy(empty),
+                torch.from_numpy(features["matrix_global"].astype(np.float32)),
+                torch.from_numpy(features["matrix_hc"].astype(np.float32)),
+            )
+
         buffers: list[np.ndarray] | None = None
         for row, index in enumerate(indices):
             features = encode_peptidoform(self.peptidoforms[index], **self._encode_kwargs())
@@ -199,6 +227,7 @@ class DeepLCDataset(Dataset):
         padding_length: int = 60,
         legacy_positional_deltas: bool = True,
         include_rolling_sum: bool = True,
+        vectorised_encoding: bool = True,
     ) -> DeepLCDataset:
         """
         Create a DeepLCDataset from a PSMList.
@@ -236,6 +265,8 @@ class DeepLCDataset(Dataset):
         include_rolling_sum
             Whether to build the rolling-sum matrix. Models with a convolutional trunk
             ignore it, and :func:`deeplc.core.predict` sets this from the model.
+        vectorised_encoding
+            Whether a batch may be encoded in one pass; see the class docstring.
 
         Returns
         -------
@@ -257,6 +288,7 @@ class DeepLCDataset(Dataset):
             padding_length=padding_length,
             legacy_positional_deltas=legacy_positional_deltas,
             include_rolling_sum=include_rolling_sum,
+            vectorised_encoding=vectorised_encoding,
         )
 
 
